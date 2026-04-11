@@ -3,13 +3,12 @@
 Implements the contract defined in docs/api/ingest-service.yaml.
 
 All upload calls are non-blocking: the caller receives a job_id immediately.
-Document processing runs in a background thread via the synchronous pipeline.
+Document processing runs in FastAPI BackgroundTasks (synchronous pipeline day-1).
 """
 
 import hashlib
 import logging
 import re
-import threading
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Query, UploadFile
@@ -33,7 +32,6 @@ _SCOPE_RE = re.compile(r"^[a-z0-9][a-z0-9-]*/[a-z0-9][a-z0-9-]*$")
 
 @router.get("/health")
 async def health() -> dict:
-    """Liveness probe — returns ok unconditionally."""
     return {"status": "ok", "service": "knowledge-ingest"}
 
 
@@ -58,23 +56,16 @@ class CreateScopeRequest(BaseModel):
 
 @router.get("/scopes")
 async def list_scopes() -> dict:
-    """List all registered scopes."""
     try:
-        scopes = registry.list_scopes()
-        return {"scopes": scopes}
+        return {"scopes": registry.list_scopes()}
     except RuntimeError as exc:
         _db_unavailable(exc)
 
 
 @router.post("/scopes", status_code=201)
 async def create_scope(body: CreateScopeRequest) -> dict:
-    """Register a new scope."""
     try:
-        scope = registry.create_scope(
-            body.scope_name,
-            description=body.description,
-            owner=body.owner,
-        )
+        scope = registry.create_scope(body.scope_name, description=body.description, owner=body.owner)
         logger.info("scope created: %s", body.scope_name)
         return scope
     except ValueError as exc:
@@ -90,27 +81,21 @@ async def create_scope(body: CreateScopeRequest) -> dict:
 async def upload_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    scope: str = Query(..., description="Target scope in {tenant}/{domain} format"),
-    owner: str = Query("", description="Operator identifier for audit log"),
+    scope: str = Query(...),
+    owner: str = Query(""),
 ) -> dict:
-    """Upload a document for ingestion. Returns job_id immediately (non-blocking).
-
-    The document is stored in S3/local immediately. Pipeline stages
-    (normalize → extract → index) run in a background thread.
-    Poll GET /jobs/{job_id} to track progress.
-    """
-    # Validate scope
+    """Upload a document. Returns {job_id, document_id, version} immediately (non-blocking)."""
     if not _SCOPE_RE.match(scope):
-        raise HTTPException(
-            status_code=422,
-            detail=f"scope must match {{tenant}}/{{domain}} using lowercase letters, digits, and hyphens",
-        )
+        raise HTTPException(status_code=422, detail="scope must match {tenant}/{domain}")
+
     try:
         if not registry.scope_exists(scope):
             raise HTTPException(
                 status_code=422,
                 detail=f"Scope '{scope}' not found. Create it with POST /scopes.",
             )
+    except HTTPException:
+        raise
     except RuntimeError as exc:
         _db_unavailable(exc)
 
@@ -122,58 +107,57 @@ async def upload_document(
     fmt = detect_format(filename)
     source_hash = hashlib.sha256(raw_bytes).hexdigest()
 
-    # Create document record (status=submitted)
+    # Create document version row (status=submitted)
+    # document_id is stable for (scope, filename); version increments
     try:
         doc = registry.create_document(
             scope=scope,
             filename=filename,
             format=fmt,
             source_hash=source_hash,
-            s3_original_key="",  # updated after S3 write below
+            s3_original_key="",   # patched after S3 write below
             owner=owner,
         )
     except RuntimeError as exc:
         _db_unavailable(exc)
 
+    row_id = doc["row_id"]
     document_id = doc["document_id"]
     version = doc["version"]
 
     # Write original to storage
     try:
         s3_original_key = store.write_original(scope, document_id, version, filename, raw_bytes)
-        registry.update_document_status(document_id, "submitted",
-                                        s3_normalized_key=None, s3_extracted_key=None)
-        # Patch s3_original_key into the record (workaround: update via direct SQL in registry)
-        _patch_original_key(document_id, s3_original_key)
+        registry.patch_s3_original_key(row_id, s3_original_key)
     except Exception as exc:
-        registry.update_document_status(document_id, "failed", error_message=str(exc))
+        registry.update_document_status(row_id, "failed", error_message=str(exc))
         raise HTTPException(status_code=500, detail=f"Storage write failed: {exc}")
 
-    # Create job record
-    job_id = registry.create_job(document_id)
+    job_id = registry.create_job(row_id)
 
     registry.write_audit_event(
         action="uploaded",
         document_id=document_id,
+        document_version=version,
         job_id=job_id,
         scope=scope,
         actor=owner,
         status="submitted",
-        metadata={"filename": filename, "format": fmt, "version": version, "bytes": len(raw_bytes)},
+        metadata={"filename": filename, "format": fmt, "bytes": len(raw_bytes)},
     )
 
     logger.info(
-        "upload accepted: document_id=%s scope=%s version=%d filename=%s job_id=%s",
-        document_id, scope, version, filename, job_id,
+        "upload: doc=%s v%d scope=%s filename=%s job=%s",
+        document_id, version, scope, filename, job_id,
     )
 
-    # Kick off background pipeline
     background_tasks.add_task(
         _run_pipeline_bg,
         job_id=job_id,
+        row_id=row_id,
         document_id=document_id,
-        scope=scope,
         version=version,
+        scope=scope,
         filename=filename,
         raw_bytes=raw_bytes,
         s3_original_key=s3_original_key,
@@ -190,7 +174,6 @@ async def upload_document(
 
 
 def _run_pipeline_bg(**kwargs) -> None:
-    """Wrapper so exceptions in the background task are logged rather than swallowed."""
     from orchestrator import run_pipeline
     try:
         run_pipeline(**kwargs)
@@ -198,22 +181,11 @@ def _run_pipeline_bg(**kwargs) -> None:
         logger.error("pipeline background task uncaught exception: %s", exc)
 
 
-def _patch_original_key(document_id: str, s3_original_key: str) -> None:
-    """Patch s3_original_key into the documents row after initial creation."""
-    from db.connection import transaction
-    with transaction() as cur:
-        cur.execute(
-            "UPDATE documents SET s3_original_key = %s WHERE document_id = %s",
-            (s3_original_key, document_id),
-        )
-
-
 # ── Job status ────────────────────────────────────────────────────────────────
 
 
 @router.get("/jobs/{job_id}")
 async def get_job_status(job_id: str) -> dict:
-    """Return current ingest job status."""
     try:
         job = registry.get_job(job_id)
     except RuntimeError as exc:
@@ -229,9 +201,8 @@ async def get_job_status(job_id: str) -> dict:
 @router.get("/documents")
 async def list_documents(
     scope: str = Query(...),
-    status: str = Query("active", enum=["active", "superseded", "deleted", "failed", "all"]),
+    status: str = Query("active"),
 ) -> dict:
-    """List documents in a scope."""
     try:
         if not registry.scope_exists(scope):
             raise HTTPException(status_code=422, detail=f"Scope '{scope}' not found")
@@ -245,7 +216,6 @@ async def list_documents(
 
 @router.get("/documents/{document_id}/versions")
 async def get_document_versions(document_id: str) -> dict:
-    """Return all versions of a document."""
     try:
         versions = registry.get_document_versions(document_id)
     except RuntimeError as exc:
@@ -276,7 +246,6 @@ class RollbackRequest(BaseModel):
 
 @router.post("/documents/{document_id}/rollback", status_code=202)
 async def rollback_document(document_id: str, body: RollbackRequest) -> dict:
-    """Restore a prior version to active; supersede current active version."""
     try:
         result = registry.rollback_to_version(document_id, body.version)
     except ValueError as exc:
@@ -287,17 +256,13 @@ async def rollback_document(document_id: str, body: RollbackRequest) -> dict:
     registry.write_audit_event(
         action="rolled_back",
         document_id=document_id,
-        scope=None,
+        document_version=body.version,
         status="success",
         metadata={
             "restored_version": result["restored_version"],
             "superseded_version": result["superseded_version"],
             "reason": body.reason,
         },
-    )
-    logger.info(
-        "rollback: document_id=%s restored_version=%d superseded_version=%s",
-        document_id, result["restored_version"], result["superseded_version"],
     )
     return result
 
@@ -307,7 +272,6 @@ async def rollback_document(document_id: str, body: RollbackRequest) -> dict:
 
 @router.get("/ui", response_class=HTMLResponse, include_in_schema=False)
 async def operator_ui() -> str:
-    """Basic operator UI: upload form and job status poller."""
     return _OPERATOR_UI_HTML
 
 
@@ -330,118 +294,72 @@ _OPERATOR_UI_HTML = """<!DOCTYPE html>
     #status-box { background: #f4f4f4; padding: 16px; border-radius: 6px;
                   font-family: monospace; font-size: 0.85rem; white-space: pre-wrap;
                   min-height: 60px; margin-top: 12px; }
-    .label-active   { color: #0f5132; font-weight: bold; }
-    .label-failed   { color: #842029; font-weight: bold; }
-    .label-indexing { color: #084298; }
-    .label-other    { color: #555; }
-    #job-poll { margin-top: 24px; }
+    .label-active { color: #0f5132; font-weight: bold; }
+    .label-failed { color: #842029; font-weight: bold; }
+    .label-other  { color: #555; }
     #upload-result { margin-top: 12px; font-size: 0.85rem; }
   </style>
 </head>
 <body>
   <h1>Agentopia — Knowledge Ingest</h1>
-
   <h2>Upload Document</h2>
   <form id="upload-form">
-    <label for="scope">Scope (e.g. joblogic-kb/api-docs)</label>
+    <label>Scope (e.g. joblogic-kb/api-docs)</label>
     <input type="text" id="scope" placeholder="tenant/domain" required>
-
-    <label for="owner">Owner (optional)</label>
+    <label>Owner (optional)</label>
     <input type="text" id="owner" placeholder="operator@example.com">
-
-    <label for="file">Document (PDF, DOCX, HTML, Markdown)</label>
-    <input type="file" id="file" accept=".pdf,.docx,.doc,.html,.htm,.md,.markdown,.txt" required>
-
+    <label>Document (PDF, DOCX, HTML, Markdown)</label>
+    <input type="file" id="file" accept=".pdf,.docx,.html,.htm,.md,.markdown,.txt" required>
     <button type="submit">Upload</button>
   </form>
   <div id="upload-result"></div>
-
   <h2>Job Status</h2>
-  <div id="job-poll">
-    <label for="job-id">Job ID</label>
-    <input type="text" id="job-id" placeholder="Paste job_id here">
-    <button onclick="pollJob()">Check Status</button>
-    <div id="status-box">Status will appear here.</div>
-  </div>
-
+  <input type="text" id="job-id" placeholder="Paste job_id here">
+  <button onclick="pollJob()">Check Status</button>
+  <div id="status-box">Status will appear here.</div>
   <script>
-    const uploadForm = document.getElementById('upload-form');
-    const uploadResult = document.getElementById('upload-result');
-    const jobIdInput = document.getElementById('job-id');
-    const statusBox = document.getElementById('status-box');
     let pollInterval = null;
-
-    uploadForm.addEventListener('submit', async (e) => {
+    document.getElementById('upload-form').addEventListener('submit', async (e) => {
       e.preventDefault();
       const scope = document.getElementById('scope').value.trim();
       const owner = document.getElementById('owner').value.trim();
       const file = document.getElementById('file').files[0];
       if (!file) return;
-
       const fd = new FormData();
       fd.append('file', file);
-
-      uploadResult.textContent = 'Uploading...';
+      document.getElementById('upload-result').textContent = 'Uploading...';
       try {
         const resp = await fetch(
           `/documents/upload?scope=${encodeURIComponent(scope)}&owner=${encodeURIComponent(owner)}`,
           { method: 'POST', body: fd }
         );
         const data = await resp.json();
-        if (!resp.ok) {
-          uploadResult.textContent = 'Error: ' + (data.detail || resp.statusText);
-          return;
-        }
-        uploadResult.textContent =
-          `Accepted. job_id: ${data.job_id}  document_id: ${data.document_id}  version: ${data.version}`;
-        jobIdInput.value = data.job_id;
+        if (!resp.ok) { document.getElementById('upload-result').textContent = 'Error: ' + (data.detail || resp.statusText); return; }
+        document.getElementById('upload-result').textContent =
+          `Accepted. job_id: ${data.job_id}  document_id: ${data.document_id}  v${data.version}`;
+        document.getElementById('job-id').value = data.job_id;
         startPolling(data.job_id);
-      } catch (err) {
-        uploadResult.textContent = 'Request failed: ' + err;
-      }
+      } catch (err) { document.getElementById('upload-result').textContent = 'Failed: ' + err; }
     });
-
-    async function pollJob() {
-      const jobId = jobIdInput.value.trim();
-      if (!jobId) return;
-      startPolling(jobId);
-    }
-
+    function pollJob() { const j = document.getElementById('job-id').value.trim(); if (j) startPolling(j); }
     function startPolling(jobId) {
       if (pollInterval) clearInterval(pollInterval);
-      fetchJobStatus(jobId);
-      pollInterval = setInterval(() => fetchJobStatus(jobId), 3000);
+      fetchStatus(jobId);
+      pollInterval = setInterval(() => fetchStatus(jobId), 3000);
     }
-
-    async function fetchJobStatus(jobId) {
+    async function fetchStatus(jobId) {
       try {
         const resp = await fetch(`/jobs/${jobId}`);
         const data = await resp.json();
-        if (!resp.ok) {
-          statusBox.textContent = 'Error: ' + (data.detail || resp.statusText);
-          clearInterval(pollInterval);
-          return;
-        }
-        const status = data.status || '';
-        let cls = 'label-other';
-        if (status === 'active') cls = 'label-active';
-        else if (status === 'failed') cls = 'label-failed';
-        else if (status === 'indexing') cls = 'label-indexing';
-
-        statusBox.innerHTML =
-          `<span class="${cls}">${status.toUpperCase()}</span>  (${data.progress_percent ?? 0}%)\n` +
-          `scope: ${data.scope}   version: ${data.version}\n` +
-          `stage: ${data.stage || '-'}\n` +
-          (data.error_message ? `error: ${data.error_message}\n` : '') +
-          `\nupdated: ${data.updated_at || '-'}`;
-
-        if (status === 'active' || status === 'failed') {
-          clearInterval(pollInterval);
-        }
-      } catch (err) {
-        statusBox.textContent = 'Poll failed: ' + err;
-        clearInterval(pollInterval);
-      }
+        const s = data.status || '';
+        const cls = s === 'active' ? 'label-active' : s === 'failed' ? 'label-failed' : 'label-other';
+        document.getElementById('status-box').innerHTML =
+          `<span class="${cls}">${s.toUpperCase()}</span> (${data.progress_percent ?? 0}%)\\n` +
+          `scope: ${data.scope}  version: ${data.version}\\nstage: ${data.stage || '-'}\\n` +
+          (data.error_message ? `error: ${data.error_message}\\n` : '') +
+          `updated: ${data.updated_at || '-'}`;
+        if (s === 'active' || s === 'failed') clearInterval(pollInterval);
+      } catch (err) { clearInterval(pollInterval); }
     }
   </script>
 </body>
@@ -449,12 +367,6 @@ _OPERATOR_UI_HTML = """<!DOCTYPE html>
 """
 
 
-# ── Error helpers ─────────────────────────────────────────────────────────────
-
-
 def _db_unavailable(exc: Exception):
     logger.error("database unavailable: %s", exc)
-    raise HTTPException(
-        status_code=503,
-        detail="Database unavailable. Set DATABASE_URL to a valid PostgreSQL connection string.",
-    )
+    raise HTTPException(status_code=503, detail="Database unavailable.")
