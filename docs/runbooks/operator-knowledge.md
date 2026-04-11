@@ -395,7 +395,92 @@ No bearer token required — same internal-network-only boundary as the operator
 
 ---
 
-## 12. Common Operations Quick Reference
+## 12. Trigger an AWS S3 Sync (W-C3.5)
+
+`POST /connectors/s3/sync` is the server-side S3 sync trigger. It calls the existing
+W-C2.1 wrapper (`sync_s3_bucket()`) which routes through `ingest_from_connector()`.
+
+**Credentials are never sent through the browser or request body.** They are resolved
+server-side from environment variables using a `secret_ref` key.
+
+### Configure S3 credentials
+
+**Default credentials** (no `secret_ref` or `secret_ref: "default"`):
+
+```bash
+export AWS_ACCESS_KEY_ID=<your-access-key>
+export AWS_SECRET_ACCESS_KEY=<your-secret-key>
+```
+
+**Named credentials** (`secret_ref: "prod"` → looks up `S3_SECRET_PROD_*`):
+
+```bash
+export S3_SECRET_PROD_ACCESS_KEY=<your-access-key>
+export S3_SECRET_PROD_SECRET_KEY=<your-secret-key>
+```
+
+For Kubernetes, store these as a K8s Secret and inject into the pod env. Never hardcode credentials.
+
+### Trigger via API
+
+```bash
+curl -X POST http://localhost:8003/connectors/s3/sync \
+  -H "Content-Type: application/json" \
+  -d '{
+    "scope": "joblogic-kb/s3-docs",
+    "bucket": "my-docs-bucket",
+    "secret_ref": "prod",
+    "prefix": "docs/",
+    "region": "us-east-1",
+    "owner": "operator@example.com"
+  }'
+```
+
+### Trigger via Operator Console
+
+Navigate to `GET /ui` → **AWS S3 Sync** section. Enter scope, bucket, and `secret_ref`.
+Credentials must already be set in the service environment — do not enter access keys in the form.
+
+### Response
+
+```json
+{
+  "scope": "joblogic-kb/s3-docs",
+  "bucket": "my-docs-bucket",
+  "total": 3,
+  "results": [
+    {
+      "source_uri": "s3://my-docs-bucket/docs/api-reference.pdf",
+      "verdict": "fetched_new",
+      "task_id": "...",
+      "error_message": null
+    }
+  ]
+}
+```
+
+| `verdict` | Meaning |
+|---|---|
+| `fetched_new` | Document ingested for the first time |
+| `fetched_updated` | New version created (content changed) |
+| `skipped_unchanged` | SHA-256 matches active version — no write |
+| `fetch_failed` | Scope not registered, auth failure, or object-level error |
+
+### Error responses
+
+| Status | Cause |
+|---|---|
+| 422 | Malformed body, missing `scope` or `bucket`, invalid `secret_ref` characters |
+| 503 | S3 credentials not found in environment, or S3 authentication rejected |
+
+### IBM COS
+
+IBM COS trigger UI is W-C3.6 (knowledge-ingest#50), which depends on the IBM COS connector
+wrapper (knowledge-ingest#41). Do not use this endpoint for IBM COS.
+
+---
+
+## 13. Common Operations Quick Reference
 
 | Task | Command |
 |---|---|
@@ -412,7 +497,8 @@ No bearer token required — same internal-network-only boundary as the operator
 | Debug retrieval | `GET /knowledge/debug/query?scope=...&q=...` (Super RAG) |
 | Configure scope mapping (env) | `CONNECTOR_SCOPE_MAPPINGS='[...]'` |
 | Configure scope mapping (file) | `CONNECTOR_SCOPE_MAPPINGS_FILE=/path/to/rules.json` |
-| HTTP connector ingest | `POST /connectors/ingest` |
+| HTTP connector ingest (generic) | `POST /connectors/ingest` |
+| AWS S3 sync trigger (UI or API) | `POST /connectors/s3/sync` |
 
 ---
 

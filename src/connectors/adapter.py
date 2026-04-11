@@ -108,6 +108,7 @@ class SyncResult:
     job_id: str | None = None
     version: int | None = None
     error_message: str | None = None
+    source_uri: str = ""
 
 
 def ingest_from_connector(event: ConnectorEvent) -> SyncResult:
@@ -148,6 +149,7 @@ def ingest_from_connector(event: ConnectorEvent) -> SyncResult:
             task_id=task_id,
             verdict="fetch_failed",
             error_message="No scope could be resolved for this connector event",
+            source_uri=source_uri,
         )
 
     logger.debug(
@@ -179,6 +181,7 @@ def ingest_from_connector(event: ConnectorEvent) -> SyncResult:
             task_id=task_id,
             verdict="fetch_failed",
             error_message=error_msg,
+            source_uri=source_uri,
         )
 
     # ── Step 1: Create sync task (queued) ─────────────────────────────────────
@@ -206,6 +209,7 @@ def ingest_from_connector(event: ConnectorEvent) -> SyncResult:
             task_id=task_id,
             verdict="fetch_failed",
             error_message=str(exc),
+            source_uri=source_uri,
         )
 
     # ── Step 4: Dedup check — compare against active version ─────────────────
@@ -228,6 +232,7 @@ def ingest_from_connector(event: ConnectorEvent) -> SyncResult:
             task_id=task_id,
             verdict="skipped_unchanged",
             document_id=doc_id,
+            source_uri=source_uri,
         )
 
     # ── Step 5: Determine verdict (new vs updated) ────────────────────────────
@@ -252,6 +257,7 @@ def ingest_from_connector(event: ConnectorEvent) -> SyncResult:
             task_id=task_id,
             verdict="fetch_failed",
             error_message=str(exc),
+            source_uri=source_uri,
         )
 
     row_id = doc_row["row_id"]
@@ -272,6 +278,7 @@ def ingest_from_connector(event: ConnectorEvent) -> SyncResult:
             task_id=task_id,
             verdict="fetch_failed",
             error_message=str(exc),
+            source_uri=source_uri,
         )
 
     set_verdict(
@@ -323,6 +330,7 @@ def ingest_from_connector(event: ConnectorEvent) -> SyncResult:
         document_id=document_id,
         job_id=job_id,
         version=version,
+        source_uri=source_uri,
     )
 
 
