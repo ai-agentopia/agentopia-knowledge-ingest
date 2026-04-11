@@ -116,7 +116,8 @@ def set_verdict(
                 resulting_row_id         = COALESCE(%s, resulting_row_id),
                 job_id                   = COALESCE(%s, job_id),
                 error_message            = COALESCE(%s, error_message),
-                updated_at               = NOW()
+                updated_at               = NOW(),
+                completed_at             = NOW()
             WHERE task_id = %s
             """,
             (
@@ -136,7 +137,7 @@ _SELECT = """
 SELECT task_id, connector_module, scope, source_uri,
        status, verdict, observed_source_revision, source_hash_observed,
        document_id, resulting_row_id, job_id, error_message,
-       created_at, updated_at
+       created_at, updated_at, completed_at
 FROM connector_sync_tasks
 """
 # Column index reference:
@@ -147,6 +148,7 @@ FROM connector_sync_tasks
 #  4  status                    11 error_message
 #  5  verdict                   12 created_at
 #  6  observed_source_revision  13 updated_at
+#                               14 completed_at
 
 
 def get_task(task_id: str) -> dict | None:
@@ -216,4 +218,5 @@ def _row_to_dict(row) -> dict:
         "error_message": row[11],
         "created_at": _iso(row[12]),
         "updated_at": _iso(row[13]),
+        "completed_at": _iso(row[14]),
     }

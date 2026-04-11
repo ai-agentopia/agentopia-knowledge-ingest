@@ -54,11 +54,14 @@ class _InMemoryRegistry:
     Extended from test_ingest_e2e.py's _InMemoryRegistry with connector fields.
     """
 
-    def __init__(self):
+    def __init__(self, known_scopes: set[str] | None = None):
         self._rows: list[dict] = []
         self._jobs: list[dict] = []
         self._audit: list[dict] = []
         self._next_row_id = 1
+        # If None, scope_exists always returns True (permissive default for most tests).
+        # Set to a frozenset to enable strict scope validation.
+        self._known_scopes = known_scopes
 
     # Identity functions — use real implementations (no DB needed)
     def stable_document_id_manual(self, scope, filename):
@@ -178,7 +181,10 @@ class _InMemoryRegistry:
         return next((j for j in self._jobs if j["job_id"] == job_id), None)
 
     def scope_exists(self, scope_name):
-        return True
+        # By default all scopes exist; tests can override by populating _known_scopes
+        if self._known_scopes is None:
+            return True
+        return scope_name in self._known_scopes
 
     def write_audit_event(self, **kwargs):
         self._audit.append(kwargs)
@@ -213,6 +219,7 @@ class _InMemoryConnectorSync:
             "resulting_row_id": None,
             "job_id": None,
             "error_message": None,
+            "completed_at": None,
         }
         return task_id
 
@@ -225,6 +232,7 @@ class _InMemoryConnectorSync:
         t = self._tasks[task_id]
         t["verdict"] = verdict
         t["status"] = "failed" if verdict == "fetch_failed" else "fetched"
+        t["completed_at"] = "2026-04-11T00:01:00+00:00"
         if observed_source_revision is not None:
             t["observed_source_revision"] = observed_source_revision
         if source_hash_observed is not None:
@@ -491,6 +499,67 @@ class TestConnectorAdapterStubbed(unittest.TestCase):
         self.assertIn(task["verdict"], ("fetched_new", "fetched_updated"))
         self.assertEqual(task["status"], "fetched",
                          "Sync task must remain fetched even if orchestrator raises")
+
+    # ── W-C1.9: Unregistered scope must fail cleanly ──────────────────────────
+
+    def test_unregistered_scope_produces_fetch_failed(self):
+        """If the resolved scope is not in the scope registry, verdict must be fetch_failed.
+
+        This is the acceptance criterion: 'unknown scope not in scope registry fails cleanly'.
+        """
+        # Registry with strict scope validation — only "registered-scope/docs" is known
+        reg = _InMemoryRegistry(known_scopes={"registered-scope/docs"})
+        sync = _InMemoryConnectorSync()
+
+        event = _make_event(scope="unregistered-scope/docs")
+        result, _ = _run_stubbed(event, reg, sync, resolved_scope=None)
+
+        self.assertEqual(result.verdict, "fetch_failed",
+                         "Unregistered scope must yield fetch_failed")
+        self.assertIsNotNone(result.error_message)
+        self.assertIn("not registered", result.error_message.lower(),
+                      "Error message must explain the scope is not registered")
+        task = sync.get_task(result.task_id)
+        self.assertEqual(task["verdict"], "fetch_failed")
+        self.assertEqual(task["status"], "failed")
+
+    def test_registered_scope_proceeds_normally(self):
+        """When scope is registered, the pipeline proceeds to fetched_new."""
+        reg = _InMemoryRegistry(known_scopes={"joblogic-kb/docs"})
+        sync = _InMemoryConnectorSync()
+        event = _make_event(scope="joblogic-kb/docs")
+        result, _ = _run_stubbed(event, reg, sync, resolved_scope=None)
+        self.assertEqual(result.verdict, "fetched_new")
+
+    def test_resolved_scope_is_also_validated_against_registry(self):
+        """A mapping-resolved scope that is not registered also yields fetch_failed."""
+        reg = _InMemoryRegistry(known_scopes={"registered/scope"})
+        sync = _InMemoryConnectorSync()
+        event = _make_event(scope="original/scope")
+        # resolve_scope returns "phantom/scope" which is not in the registry
+        result, _ = _run_stubbed(event, reg, sync, resolved_scope="phantom/scope")
+        self.assertEqual(result.verdict, "fetch_failed")
+        self.assertIn("not registered", result.error_message.lower())
+
+    # ── W-C1.3: completed_at set on terminal verdicts ─────────────────────────
+
+    def test_completed_at_is_set_on_fetched_new_task(self):
+        """connector_sync_tasks.completed_at must be set when verdict is finalized."""
+        reg, sync = self._reg_sync()
+        result, _ = _run_stubbed(_make_event(), reg, sync)
+        task = sync.get_task(result.task_id)
+        self.assertIsNotNone(task["completed_at"],
+                             "completed_at must be set when task reaches a terminal state")
+
+    def test_completed_at_is_set_on_fetch_failed_task(self):
+        """completed_at must be set for fetch_failed too (terminal state)."""
+        reg, sync = self._reg_sync()
+        reg = _InMemoryRegistry(known_scopes={"registered/scope"})
+        event = _make_event(scope="unregistered/scope")
+        result, _ = _run_stubbed(event, reg, sync, resolved_scope=None)
+        self.assertEqual(result.verdict, "fetch_failed")
+        task = sync.get_task(result.task_id)
+        self.assertIsNotNone(task["completed_at"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
