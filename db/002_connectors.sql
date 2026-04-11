@@ -59,13 +59,25 @@ CREATE TABLE IF NOT EXISTS connector_sync_tasks (
     verdict                  VARCHAR(50),
     -- fetched_new | fetched_updated | skipped_unchanged | fetch_failed
     observed_source_revision TEXT,
-    -- Latest revision stamp observed at fetch time.
+    -- Revision stamp observed at fetch time.
     -- Written here ONLY — never propagated back to documents.source_revision.
-    -- A skipped_unchanged task still records observed_source_revision here
-    -- so operators can see that the external source was checked.
+    -- Recorded for all verdicts (including skipped_unchanged) so operators
+    -- can verify the external source was checked and what revision was seen.
+    source_hash_observed     VARCHAR(64),
+    -- SHA-256 of the raw file bytes fetched by the connector.
+    -- Written for all verdicts that complete a fetch (fetched_new, fetched_updated,
+    -- skipped_unchanged). NULL for fetch_failed (bytes not available).
+    -- This is the dedup evidence: allows auditing WHY a sync was skipped.
     document_id              UUID,
-    -- Populated for fetched_new and fetched_updated verdicts.
-    -- NULL for skipped_unchanged (no document row written).
+    -- The stable logical document_id for this (scope, connector_module, source_uri).
+    -- Set for ALL verdicts where a document_id can be computed — including
+    -- skipped_unchanged (the document exists; we just did not create a new version).
+    -- NULL only for fetch_failed where source_uri validation itself fails.
+    resulting_row_id         BIGINT,
+    -- The row_id (surrogate PK) of the documents row created/updated by this sync.
+    -- Populated for fetched_new and fetched_updated verdicts only.
+    -- NULL for skipped_unchanged (no new document row written) and fetch_failed.
+    -- Allows direct join to documents without going through document_id + version.
     job_id                   UUID,
     -- Populated when an ingest_job is created (fetched_new / fetched_updated only).
     -- NULL for skipped_unchanged and fetch_failed.

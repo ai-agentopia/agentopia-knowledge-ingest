@@ -50,6 +50,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 
+from connectors.scope_mapping import resolve_scope
 from db import registry
 from db.connector_sync import create_sync_task, get_task, mark_fetching, set_verdict
 from orchestrator import run_pipeline
@@ -118,8 +119,41 @@ def ingest_from_connector(event: ConnectorEvent) -> SyncResult:
     Returns a SyncResult with the verdict and identifiers.
     """
     connector_module = event.connector_module
-    scope = event.scope
     source_uri = event.source_uri
+
+    # ── Step 0: Resolve scope via scope mapping (W-C1.9) ─────────────────────
+    # resolve_scope() checks CONNECTOR_SCOPE_MAPPINGS for a matching rule.
+    # Falls back to event.scope when no mapping matches (e.g. scope supplied
+    # explicitly by callers in tests or CLI tools).
+    resolved = resolve_scope(connector_module, source_uri)
+    scope = resolved if resolved is not None else event.scope
+
+    if not scope:
+        # Neither mapping nor event provided a scope — cannot proceed.
+        logger.error(
+            "connector_adapter: no scope resolved for connector=%s uri=%s "
+            "— set CONNECTOR_SCOPE_MAPPINGS or provide event.scope",
+            connector_module, source_uri,
+        )
+        # Create a minimal task record so the failure is visible in audit
+        task_id = create_sync_task(
+            connector_module=connector_module,
+            scope="__unresolved__",
+            source_uri=source_uri,
+        )
+        mark_fetching(task_id)
+        set_verdict(task_id, verdict="fetch_failed",
+                    error_message="No scope could be resolved for this connector event")
+        return SyncResult(
+            task_id=task_id,
+            verdict="fetch_failed",
+            error_message="No scope could be resolved for this connector event",
+        )
+
+    logger.debug(
+        "connector_adapter: scope resolved connector=%s uri=%s scope=%s (via_mapping=%s)",
+        connector_module, source_uri, scope, resolved is not None,
+    )
 
     # ── Step 1: Create sync task (queued) ─────────────────────────────────────
     task_id = create_sync_task(
@@ -156,7 +190,9 @@ def ingest_from_connector(event: ConnectorEvent) -> SyncResult:
             task_id,
             verdict="skipped_unchanged",
             observed_source_revision=event.source_revision,
+            source_hash_observed=source_hash,
             document_id=doc_id,
+            # resulting_row_id is NULL — no new document row was written
         )
         logger.info(
             "connector_adapter: task=%s verdict=skipped_unchanged doc=%s scope=%s",
@@ -216,7 +252,9 @@ def ingest_from_connector(event: ConnectorEvent) -> SyncResult:
         task_id,
         verdict=verdict,
         observed_source_revision=event.source_revision,
+        source_hash_observed=source_hash,
         document_id=document_id,
+        resulting_row_id=row_id,
         job_id=job_id,
     )
     logger.info(
