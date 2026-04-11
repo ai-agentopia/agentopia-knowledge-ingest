@@ -774,6 +774,103 @@ integration is a future issue.
 
 ---
 
+## 15. Google Drive Browser Picker (W-C3.4)
+
+**Issue:** knowledge-ingest#48.
+
+This feature adds a **browser-side** Google Drive picker to the operator console at `GET /ui`.
+It is a completely separate path from the server-side `sync_gdrive()` wrapper (W-C2.2/#38).
+No OAuth tokens are sent to or stored on the server — the browser obtains a session-scoped
+access token directly from Google and fetches the file bytes client-side before submitting
+them to `POST /connectors/ingest`.
+
+### Required environment variables
+
+Set these on the `agentopia-knowledge-ingest` service before starting:
+
+| Variable | Description |
+|---|---|
+| `GOOGLE_PICKER_API_KEY` | Browser-restricted API key with Google Picker API enabled (Google Cloud Console → APIs & Services → Credentials) |
+| `GOOGLE_PICKER_CLIENT_ID` | OAuth 2.0 client ID (same project, `drive.readonly` scope, authorized JavaScript origins must include the console URL) |
+| `GOOGLE_PICKER_APP_ID` | Google Cloud project number — required for Shared Drive visibility (optional for My Drive only) |
+
+If `GOOGLE_PICKER_API_KEY` or `GOOGLE_PICKER_CLIENT_ID` are not set, the picker button is
+disabled and a configuration warning is displayed in the console. No picker functionality
+is available until both are set.
+
+### How the browser flow works
+
+1. Operator opens `GET /ui` → navigates to the **Google Drive Ingest** section.
+2. Clicks **Open Google Drive Picker** — this triggers the GIS implicit grant flow,
+   requesting a session-scoped `access_token` with `drive.readonly` scope.
+   The access token is never sent to or logged by the server.
+3. The Google Picker dialog opens. The operator selects a file.
+4. **Rejection at selection:** Google Sheets and Google Slides are rejected with a
+   clear message. Selecting them does not enable the submit button.
+5. On selection of a supported file, the UI auto-populates:
+   - `source_uri = gdrive://{fileId}` — stable across renames and folder moves
+   - `filename` — display name from Drive API metadata
+   - `format` — inferred from MIME type (PDF, DOCX, HTML, Markdown, plain text;
+     Google Docs exported as DOCX)
+6. Operator enters the target **scope** and optional **owner**, then clicks
+   **Submit to /connectors/ingest**.
+7. The browser fetches file bytes from the Drive API (direct download for native
+   formats; export endpoint for Google Docs → DOCX).
+8. Bytes are base64-encoded in-browser and POSTed to `POST /connectors/ingest`
+   as `raw_bytes_b64`, with `connector_module = "google_drive"`.
+9. Response verdicts are displayed with colour coding:
+   `fetched_new` (green), `fetched_updated` (blue),
+   `skipped_unchanged` (grey), `fetch_failed` (red).
+10. Error codes 413 (file too large, limit 50 MiB) and 422 (validation error)
+    are shown with detail text.
+
+### Supported and rejected file types
+
+| Google Drive type | Browser action | Format submitted |
+|---|---|---|
+| PDF | Direct download | `pdf` |
+| DOCX (Office) | Direct download | `docx` |
+| HTML | Direct download | `html` |
+| Markdown / plain text | Direct download | `markdown` / `txt` |
+| Google Docs | Export → DOCX | `docx` |
+| **Google Sheets** | **Rejected at selection** | — |
+| **Google Slides** | **Rejected at selection** | — |
+
+Google Sheets and Google Slides are rejected because the ingest normalizer does not
+support XLSX or PPTX formats. Rejection happens at picker selection time — no content
+is downloaded for these types.
+
+### Identity contract (aligned with W-C2.2/#38)
+
+| Field | Value |
+|---|---|
+| `connector_module` | `"google_drive"` |
+| `source_uri` | `gdrive://{fileId}` — stable across renames |
+| `source_revision` | Not submitted via the browser picker path. The Google Picker API response does not include `modifiedTime`. The browser does not send `source_revision` in the `POST /connectors/ingest` payload. The adapter stores it as `NULL` — no auto-assignment occurs. If `modifiedTime` provenance is required, it must be fetched separately from the Drive Files API and submitted explicitly by the caller. |
+
+### Difference from W-C2.2 (server-side sync wrapper)
+
+| Dimension | W-C3.4 browser picker | W-C2.2 server-side wrapper |
+|---|---|---|
+| Trigger | Operator selects a file in-browser | Scheduled or manual `sync_gdrive()` call |
+| OAuth token | Browser GIS implicit grant (session-scoped, never sent to server) | Refresh token persisted to a PVC/token_file; server refreshes as needed |
+| Files | One file per operator action | All files in configured folders |
+| Scope entry | Entered manually in the UI | Configured via `CONNECTOR_SCOPE_MAPPINGS` |
+| Server-side token storage | None — browser handles tokens entirely | Required — token_file on PVC |
+
+### Google Cloud Console setup (operator pre-requisite)
+
+This is a one-time setup, outside the scope of the picker code:
+
+1. Create or select a Google Cloud project.
+2. Enable the **Google Picker API** and **Google Drive API**.
+3. Create a **browser-restricted API key** → restrict to Google Picker API → set HTTP referrers to the console origin.
+4. Create an **OAuth 2.0 client ID** (Web application type) → add the operator console origin to **Authorized JavaScript origins**.
+5. Note the **project number** for `GOOGLE_PICKER_APP_ID` (Shared Drive support).
+6. Set the three env vars on the service and restart.
+
+---
+
 ## Service URLs
 
 | Service | Default Port | Auth |

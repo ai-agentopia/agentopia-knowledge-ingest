@@ -75,6 +75,17 @@ class Settings:
         self.log_format = os.getenv("LOG_FORMAT", "text")
         self.port = int(os.getenv("PORT", "8003"))
 
+        # ── Google Drive Picker (W-C3.4, knowledge-ingest#48) ─────────────────
+        # Browser-side picker config only — no server-side OAuth management.
+        # Set these to enable the Google Drive picker in the operator console UI.
+        # Obtain values from Google Cloud Console → APIs & Services → Credentials.
+        # GOOGLE_PICKER_API_KEY: browser-restricted API key with Google Picker API enabled.
+        # GOOGLE_PICKER_CLIENT_ID: OAuth 2.0 client ID (same project, drive.readonly scope).
+        # GOOGLE_PICKER_APP_ID: Google Cloud project number (for Shared Drive support).
+        self.google_picker_api_key = os.getenv("GOOGLE_PICKER_API_KEY", "")
+        self.google_picker_client_id = os.getenv("GOOGLE_PICKER_CLIENT_ID", "")
+        self.google_picker_app_id = os.getenv("GOOGLE_PICKER_APP_ID", "")
+
     def use_s3(self) -> bool:
         """Return True if S3 is configured as the storage backend."""
         return bool(self.s3_bucket)
