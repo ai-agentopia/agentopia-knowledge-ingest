@@ -3,8 +3,10 @@
 Versioning model
 ----------------
 document_id is the STABLE logical identity of a document. It is derived
-deterministically from (scope, filename) using a MD5-seeded UUID so the same
-logical document always gets the same ID, even across service restarts.
+deterministically from (scope, filename) for manual uploads and from
+(scope, connector_module, source_uri) for connector-originated documents.
+The same logical document always resolves to the same document_id across
+service restarts and re-uploads.
 
 version increments on each upload of the same logical document:
   - Upload 1  → document_id=X, version=1, status=submitted
@@ -13,6 +15,19 @@ version increments on each upload of the same logical document:
 The documents table primary key is a surrogate (row_id BIGSERIAL). The composite
 (document_id, version) has a UNIQUE constraint. ingest_jobs.row_id FK points to
 the specific document version row, not just the logical document.
+
+Identity spaces
+---------------
+Manual uploads use stable_document_id_manual(scope, filename) — key prefix "manual://".
+Connector documents use stable_document_id_connector(scope, connector_module, source_uri)
+— key prefix "connector://". The two spaces never collide even with identical filenames.
+
+Provenance immutability
+-----------------------
+documents.source_revision is IMMUTABLE per row. It is set once on INSERT by
+the connector adapter. No UPDATE in this module touches source_revision.
+connector_sync_tasks.observed_source_revision holds the latest observation
+from subsequent re-syncs (see db/connector_sync.py).
 
 Audit log
 ---------
@@ -32,17 +47,68 @@ logger = logging.getLogger(__name__)
 
 # ── Stable document_id derivation ────────────────────────────────────────────
 
+# Regex to detect a bare 40-character hex SHA in a URI (commit SHA, blob SHA, etc.)
+# Used to reject source_uri values that embed volatile revision selectors.
+import re as _re
+_SHA40_RE = _re.compile(r'(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])', _re.IGNORECASE)
 
-def stable_document_id(scope: str, filename: str) -> str:
-    """Derive a deterministic UUID from (scope, filename).
+
+def _validate_source_uri(source_uri: str) -> None:
+    """Raise ValueError if source_uri contains a volatile revision selector.
+
+    source_uri must be a stable logical locator. Embedding a 40-character hex
+    commit SHA or blob SHA (e.g. GitHub /blob/<sha>/ URLs, ?ref=<sha>) makes the
+    URI unstable — two versions of the same document would get different IDs.
+
+    Use source_revision to carry the exact external revision at ingest time.
+    """
+    if _SHA40_RE.search(source_uri):
+        raise ValueError(
+            f"source_uri must not contain a 40-character hex revision selector "
+            f"(commit SHA / blob SHA detected). "
+            f"Use source_revision to record the exact external revision. "
+            f"Got: {source_uri!r}"
+        )
+
+
+def stable_document_id_manual(scope: str, filename: str) -> str:
+    """Derive a deterministic UUID for a manually-uploaded document.
+
+    Key space: "manual://{scope}:{filename}"
 
     The same logical document (same scope + filename) always resolves to the
     same UUID, regardless of upload count or service restart. This makes
     document_id a stable logical identity rather than a per-upload handle.
+
+    Never collides with stable_document_id_connector — different key prefix.
     """
-    key = f"{scope}:{filename}"
+    key = f"manual://{scope}:{filename}"
     digest = hashlib.md5(key.encode()).hexdigest()
     return str(uuid.UUID(digest))
+
+
+def stable_document_id_connector(scope: str, connector_module: str, source_uri: str) -> str:
+    """Derive a deterministic UUID for a connector-originated document.
+
+    Key space: "connector://{scope}:{connector_module}:{source_uri}"
+
+    source_uri must be the stable logical locator for the external document —
+    it must NOT contain volatile revision selectors (commit SHAs, etc.).
+    Use source_revision to record the exact external revision at ingest time.
+
+    Never collides with stable_document_id_manual — different key prefix.
+
+    Raises ValueError if source_uri contains a 40-character hex SHA.
+    """
+    _validate_source_uri(source_uri)
+    key = f"connector://{scope}:{connector_module}:{source_uri}"
+    digest = hashlib.md5(key.encode()).hexdigest()
+    return str(uuid.UUID(digest))
+
+
+# Backward-compat alias: existing callers using stable_document_id() continue to work.
+# New code should use stable_document_id_manual() explicitly.
+stable_document_id = stable_document_id_manual
 
 
 # ── Scope operations ──────────────────────────────────────────────────────────
@@ -120,17 +186,30 @@ def create_document(
     source_hash: str,
     s3_original_key: str,
     owner: str = "",
+    # Connector fields — all None for manually-uploaded documents.
+    connector_module: str | None = None,
+    source_uri: str | None = None,
+    source_revision: str | None = None,
 ) -> dict:
     """Create a new document version row and return it.
 
-    document_id is derived deterministically from (scope, filename) so the same
-    logical document always shares one document_id across all its versions.
+    For manual uploads (connector_module=None):
+      document_id is derived from stable_document_id_manual(scope, filename).
+
+    For connector documents (connector_module set):
+      document_id is derived from stable_document_id_connector(scope, connector_module, source_uri).
+      source_revision is stored ONCE and never updated (provenance immutability).
 
     version = max existing version for this document_id + 1, or 1 for first upload.
 
     Returns the created row as a dict including row_id (used for ingest_jobs FK).
     """
-    doc_id = stable_document_id(scope, filename)
+    if connector_module is not None:
+        if source_uri is None:
+            raise ValueError("source_uri is required when connector_module is set")
+        doc_id = stable_document_id_connector(scope, connector_module, source_uri)
+    else:
+        doc_id = stable_document_id_manual(scope, filename)
 
     with transaction() as cur:
         # Determine next version for this logical document
@@ -144,11 +223,13 @@ def create_document(
             """
             INSERT INTO documents
                 (document_id, version, scope, owner, filename, format,
-                 status, source_hash, s3_original_key)
-            VALUES (%s, %s, %s, %s, %s, %s, 'submitted', %s, %s)
+                 status, source_hash, s3_original_key,
+                 connector_module, source_uri, source_revision)
+            VALUES (%s, %s, %s, %s, %s, %s, 'submitted', %s, %s, %s, %s, %s)
             RETURNING row_id, document_id, version, created_at
             """,
-            (doc_id, version, scope, owner, filename, format, source_hash, s3_original_key),
+            (doc_id, version, scope, owner, filename, format, source_hash, s3_original_key,
+             connector_module, source_uri, source_revision),
         )
         row = cur.fetchone()
         return {
@@ -161,6 +242,9 @@ def create_document(
             "status": "submitted",
             "source_hash": source_hash,
             "s3_original_key": s3_original_key,
+            "connector_module": connector_module,
+            "source_uri": source_uri,
+            "source_revision": source_revision,
             "created_at": row[3].isoformat(),
         }
 
@@ -359,9 +443,19 @@ _DOC_SELECT = """
 SELECT d.row_id, d.document_id, d.version, d.scope, d.owner, d.filename,
        d.format, d.status, d.source_hash, d.s3_original_key,
        d.s3_normalized_key, d.s3_extracted_key, d.error_message,
-       d.created_at, d.updated_at
+       d.created_at, d.updated_at,
+       d.connector_module, d.source_uri, d.source_revision
 FROM documents d
 """
+# Column index reference:
+#  0  row_id          8  source_hash       15 connector_module
+#  1  document_id     9  s3_original_key   16 source_uri
+#  2  version         10 s3_normalized_key 17 source_revision
+#  3  scope           11 s3_extracted_key
+#  4  owner           12 error_message
+#  5  filename        13 created_at
+#  6  format          14 updated_at
+#  7  status
 
 
 def _doc_row_to_dict(row) -> dict:
@@ -383,6 +477,9 @@ def _doc_row_to_dict(row) -> dict:
         "error_message": row[12],
         "created_at": _iso(row[13]),
         "updated_at": _iso(row[14]),
+        "connector_module": row[15],
+        "source_uri": row[16],
+        "source_revision": row[17],
     }
 
 
