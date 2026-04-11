@@ -48,22 +48,30 @@ def transaction() -> Generator[psycopg.Cursor, None, None]:
 
 
 def apply_schema() -> None:
-    """Apply the initial schema migration (db/001_initial.sql) idempotently."""
+    """Apply all schema migrations in db/NNN_*.sql order, idempotently.
+
+    Scans db/ for files matching the NNN_*.sql pattern and applies them in
+    sorted order. Each file uses IF NOT EXISTS / ADD COLUMN IF NOT EXISTS so
+    re-running is safe.
+    """
     import pathlib
 
-    sql_path = pathlib.Path(__file__).parent.parent.parent / "db" / "001_initial.sql"
-    if not sql_path.exists():
-        logger.warning("db: schema file not found at %s — skipping migration", sql_path)
+    db_dir = pathlib.Path(__file__).parent.parent.parent / "db"
+    sql_files = sorted(db_dir.glob("[0-9][0-9][0-9]_*.sql"))
+
+    if not sql_files:
+        logger.warning("db: no schema files found in %s — skipping migration", db_dir)
         return
 
-    sql = sql_path.read_text()
-    try:
-        with transaction() as cur:
-            cur.execute(sql)
-        logger.info("db: schema migration applied successfully")
-    except Exception as exc:
-        logger.error("db: schema migration failed: %s", exc)
-        raise
+    for sql_path in sql_files:
+        sql = sql_path.read_text()
+        try:
+            with transaction() as cur:
+                cur.execute(sql)
+            logger.info("db: applied migration %s", sql_path.name)
+        except Exception as exc:
+            logger.error("db: migration %s failed: %s", sql_path.name, exc)
+            raise
 
 
 def close_connection() -> None:
