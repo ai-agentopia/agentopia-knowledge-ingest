@@ -461,6 +461,45 @@ _OPERATOR_UI_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- ── AWS S3 Sync Trigger (W-C3.5) ──────────────────────────────────── -->
+  <div class="section">
+    <h2 id="hS3" onclick="toggle('sS3','hS3')">&#x1F5C4; AWS S3 Sync</h2>
+    <div id="sS3" class="section-body">
+      <p style="font-size:0.82rem;color:#555;margin-top:0">
+        Triggers a server-side pull of an S3 bucket into a knowledge scope.
+        Credentials are resolved server-side from environment variables — do not enter access keys here.
+        Set <code>AWS_ACCESS_KEY_ID</code> / <code>AWS_SECRET_ACCESS_KEY</code> (default),
+        or <code>S3_SECRET_&lt;REF&gt;_ACCESS_KEY</code> / <code>S3_SECRET_&lt;REF&gt;_SECRET_KEY</code>
+        for a named reference.
+      </p>
+      <div class="row">
+        <div>
+          <label>Scope (tenant/domain)</label>
+          <input id="s3Scope" placeholder="joblogic-kb/s3-docs">
+          <label>Bucket</label>
+          <input id="s3Bucket" placeholder="my-docs-bucket">
+          <label>Secret Ref (leave blank for default AWS env vars)</label>
+          <input id="s3SecretRef" placeholder="default">
+        </div>
+        <div>
+          <label>Prefix (optional key filter, e.g. docs/)</label>
+          <input id="s3Prefix" placeholder="">
+          <label>Region (optional, default us-east-1)</label>
+          <input id="s3Region" placeholder="us-east-1">
+          <label>Endpoint URL (optional, for MinIO / R2)</label>
+          <input id="s3Endpoint" placeholder="">
+          <label>Owner (optional)</label>
+          <input id="s3Owner" placeholder="operator@example.com">
+        </div>
+      </div>
+      <div class="actions">
+        <button onclick="doS3Sync()">Run S3 Sync</button>
+      </div>
+      <div id="s3Out" class="output" style="margin-top:8px">Ready.</div>
+      <div id="s3Table" style="margin-top:8px"></div>
+    </div>
+  </div>
+
   <script>
   // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -803,6 +842,50 @@ _OPERATOR_UI_HTML = """<!DOCTYPE html>
           <td style="font-size:0.78rem;max-width:260px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${r.text.replace(/"/g,'&quot;')}">${r.text.slice(0,120)}${r.text.length>120?'…':''}</td>
         </tr>`).join('') + '</tbody></table>';
     } catch (e) { el.innerHTML = '<em>Error: ' + e.message + '</em>'; }
+  }
+
+  // ── AWS S3 Sync (W-C3.5) ──────────────────────────────────────────────────
+
+  async function doS3Sync() {
+    const scope      = document.getElementById('s3Scope').value.trim();
+    const bucket     = document.getElementById('s3Bucket').value.trim();
+    const secretRef  = document.getElementById('s3SecretRef').value.trim() || 'default';
+    const prefix     = document.getElementById('s3Prefix').value.trim();
+    const region     = document.getElementById('s3Region').value.trim();
+    const endpoint   = document.getElementById('s3Endpoint').value.trim();
+    const owner      = document.getElementById('s3Owner').value.trim();
+    const outEl      = document.getElementById('s3Out');
+    const tableEl    = document.getElementById('s3Table');
+    if (!scope || !bucket) { outEl.textContent = 'Scope and bucket are required.'; return; }
+    outEl.textContent = 'Running S3 sync...';
+    tableEl.innerHTML = '';
+    try {
+      const body = { scope, bucket, secret_ref: secretRef };
+      if (prefix)   body.prefix       = prefix;
+      if (region)   body.region        = region;
+      if (endpoint) body.endpoint_url  = endpoint;
+      if (owner)    body.owner         = owner;
+      const resp = await fetch('/connectors/s3/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await resp.json();
+      if (!resp.ok) { outEl.textContent = 'Error ' + resp.status + ': ' + (data.detail || resp.statusText); return; }
+      outEl.textContent = `Done. ${data.total} object(s) processed in scope ${data.scope} from bucket ${data.bucket}.`;
+      if (!data.results || !data.results.length) { tableEl.innerHTML = '<em>No objects found.</em>'; return; }
+      const verdictColor = { fetched_new: '#155724', fetched_updated: '#004085', skipped_unchanged: '#383d41', fetch_failed: '#721c24' };
+      tableEl.innerHTML = '<table><thead><tr><th>source_uri</th><th>verdict</th><th>task_id</th><th>error</th></tr></thead><tbody>' +
+        data.results.map(r => {
+          const color = verdictColor[r.verdict] || '#383d41';
+          return `<tr>
+            <td style="font-family:monospace;font-size:0.75rem;max-width:300px;overflow:hidden;text-overflow:ellipsis">${r.source_uri || '-'}</td>
+            <td style="color:${color};font-weight:600">${r.verdict}</td>
+            <td style="font-family:monospace;font-size:0.75rem">${r.task_id || '-'}</td>
+            <td style="font-size:0.78rem;color:#721c24">${r.error_message || ''}</td>
+          </tr>`;
+        }).join('') + '</tbody></table>';
+    } catch (e) { outEl.textContent = 'Error: ' + e.message; }
   }
   </script>
 </body>

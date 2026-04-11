@@ -18,6 +18,7 @@ from fastapi import FastAPI
 
 from api.connector_routes import router as connector_router
 from api.routes import router
+from api.s3_routes import router as s3_router
 from config import get_settings
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
@@ -91,3 +92,4 @@ app = FastAPI(
 
 app.include_router(router)
 app.include_router(connector_router)
+app.include_router(s3_router)
