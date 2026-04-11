@@ -323,7 +323,79 @@ as the last rule to ensure every document lands somewhere.
 
 ---
 
-## 11. Common Operations Quick Reference
+## 11. Trigger Ingestion via HTTP (W-C3.1)
+
+`POST /connectors/ingest` is the HTTP transport entry point for out-of-process connectors
+or any caller that cannot use the in-process `ingest_from_connector()` adapter directly.
+
+**All W-C1 invariants are enforced by the adapter — this endpoint adds no business logic.**
+
+### Request
+
+```bash
+curl -X POST http://localhost:8003/connectors/ingest \
+  -H "Content-Type: application/json" \
+  -d '{
+    "connector_module": "aws_s3",
+    "scope": "joblogic-kb/docs",
+    "source_uri": "s3://my-bucket/docs/api-reference.pdf",
+    "filename": "api-reference.pdf",
+    "format": "pdf",
+    "raw_bytes_b64": "<base64-encoded file content>",
+    "source_revision": "2026-01-15T10:30:00+00:00",
+    "owner": "operator@example.com",
+    "metadata": {"s3_bucket": "my-bucket", "s3_key": "docs/api-reference.pdf"}
+  }'
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `connector_module` | yes | Connector identifier (e.g. `"aws_s3"`, `"confluence"`) |
+| `scope` | yes | Target knowledge scope (must be registered via `POST /scopes`) |
+| `source_uri` | yes | Stable logical locator for the source document |
+| `filename` | yes | Display filename (e.g. `"api-reference.pdf"`) |
+| `format` | yes | One of: `pdf`, `docx`, `html`, `markdown`, `txt` |
+| `raw_bytes_b64` | yes | Base64-encoded (RFC 4648) raw document bytes |
+| `source_revision` | no | Revision stamp for provenance (e.g. ETag, LastModified) |
+| `owner` | no | Actor identifier for audit log |
+| `metadata` | no | Extra key/value pairs passed through to document metadata |
+
+### Response
+
+HTTP 200 for all adapter verdicts (including `fetch_failed`):
+
+```json
+{
+  "task_id": "...",
+  "verdict": "fetched_new",
+  "document_id": "...",
+  "job_id": "...",
+  "version": 1,
+  "error_message": null
+}
+```
+
+| `verdict` | Meaning |
+|---|---|
+| `fetched_new` | Document created for the first time |
+| `fetched_updated` | New version created (content changed) |
+| `skipped_unchanged` | SHA-256 matches active version — no write |
+| `fetch_failed` | Scope not registered or adapter-level error |
+
+### Error responses
+
+| Status | Cause |
+|---|---|
+| 422 | Malformed body, missing required field, invalid format, or invalid base64 |
+| 413 | Decoded payload exceeds 50 MiB |
+
+### Auth
+
+No bearer token required — same internal-network-only boundary as the operator UI.
+
+---
+
+## 12. Common Operations Quick Reference
 
 | Task | Command |
 |---|---|
@@ -340,6 +412,7 @@ as the last rule to ensure every document lands somewhere.
 | Debug retrieval | `GET /knowledge/debug/query?scope=...&q=...` (Super RAG) |
 | Configure scope mapping (env) | `CONNECTOR_SCOPE_MAPPINGS='[...]'` |
 | Configure scope mapping (file) | `CONNECTOR_SCOPE_MAPPINGS_FILE=/path/to/rules.json` |
+| HTTP connector ingest | `POST /connectors/ingest` |
 
 ---
 
