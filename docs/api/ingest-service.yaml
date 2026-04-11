@@ -1,0 +1,572 @@
+openapi: "3.0.3"
+
+info:
+  title: Agentopia Document Ingest Service
+  version: "1.0.0"
+  description: |
+    Upstream knowledge ingestion API for Agentopia.
+
+    Accepts documents (PDF, DOCX, HTML, markdown), runs them through the
+    normalization and extraction pipeline, and hands off to Super RAG for
+    indexing. All uploads are non-blocking: the caller receives a job_id
+    immediately and polls GET /jobs/{job_id} for progress.
+
+    Documents are not visible to retrieval queries until their status reaches `active`.
+
+servers:
+  - url: http://localhost:8003
+    description: Local development
+  - url: https://knowledge-ingest.agentopia.internal
+    description: Production (internal)
+
+tags:
+  - name: Upload
+    description: Document upload and job tracking
+  - name: Documents
+    description: Document lifecycle management
+  - name: Scopes
+    description: Scope registry management
+  - name: Debug
+    description: Operator retrieval debugging
+  - name: Health
+    description: Service health
+
+paths:
+
+  # ---------------------------------------------------------------------------
+  # Upload
+  # ---------------------------------------------------------------------------
+
+  /documents/upload:
+    post:
+      operationId: uploadDocument
+      tags: [Upload]
+      summary: Upload a document for ingestion
+      description: |
+        Accepts a document file and a target scope. Returns a job_id immediately.
+        The document is enqueued for normalization, extraction, and indexing.
+        Poll GET /jobs/{job_id} to track progress.
+
+        The document is not visible to retrieval until its status = `active`.
+
+        Validation:
+        - scope must exist in the scope registry (POST /scopes to create)
+        - file must be one of: pdf, docx, html, md, txt
+        - duplicate detection: if the same file hash already exists as `active`
+          in the same scope and version, returns 200 with the existing document_id
+          and a note that ingest was skipped
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, scope]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: Document file (PDF, DOCX, HTML, markdown)
+                scope:
+                  type: string
+                  description: Target scope in {tenant}/{domain} format
+                  example: joblogic-kb/api-docs
+                owner:
+                  type: string
+                  description: Operator identifier for audit log
+                  example: operator@agentopia.io
+      responses:
+        "202":
+          description: Document accepted, ingestion started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadResponse"
+        "200":
+          description: Duplicate detected; ingest skipped, returning existing document
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadResponse"
+        "400":
+          description: Invalid file type or missing required fields
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          description: Scope not found in registry
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # ---------------------------------------------------------------------------
+  # Job status
+  # ---------------------------------------------------------------------------
+
+  /jobs/{job_id}:
+    get:
+      operationId: getJobStatus
+      tags: [Upload]
+      summary: Get ingest job status
+      description: |
+        Returns the current state of an ingest job. Poll this endpoint to
+        track document processing progress.
+
+        Stage values follow the document state machine:
+          submitted -> normalizing -> normalized -> extracting -> extracted -> indexing -> active
+          or: failed (at any stage)
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Job status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobStatus"
+        "404":
+          description: Job not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # ---------------------------------------------------------------------------
+  # Documents
+  # ---------------------------------------------------------------------------
+
+  /documents:
+    get:
+      operationId: listDocuments
+      tags: [Documents]
+      summary: List documents in a scope
+      description: |
+        Returns all documents for the given scope. Each entry shows the
+        latest version and its current status.
+      parameters:
+        - name: scope
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Scope to list documents for
+          example: joblogic-kb/api-docs
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [active, superseded, deleted, failed, all]
+            default: active
+          description: Filter by document status
+      responses:
+        "200":
+          description: List of documents
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  documents:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/DocumentSummary"
+        "422":
+          description: Scope not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /documents/{document_id}/versions:
+    get:
+      operationId: getDocumentVersions
+      tags: [Documents]
+      summary: Get version history for a document
+      description: Returns all versions of a document with their status and timestamps.
+      parameters:
+        - name: document_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Version history
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  document_id:
+                    type: string
+                    format: uuid
+                  scope:
+                    type: string
+                  filename:
+                    type: string
+                  versions:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/DocumentVersion"
+        "404":
+          description: Document not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /documents/{document_id}/rollback:
+    post:
+      operationId: rollbackDocument
+      tags: [Documents]
+      summary: Rollback a document to a prior version
+      description: |
+        Restores the specified version to `active`. The currently active version
+        transitions to `superseded`. A new ingest job is not created; the prior
+        version's existing Qdrant chunks are updated to `active` via payload update.
+
+        Rollback is rejected if:
+        - The specified version does not exist
+        - The specified version is already `active`
+        - The specified version has status `deleted`
+      parameters:
+        - name: document_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [version]
+              properties:
+                version:
+                  type: integer
+                  description: Version number to restore to active
+                  example: 1
+                reason:
+                  type: string
+                  description: Optional operator note recorded in audit log
+      responses:
+        "202":
+          description: Rollback accepted; version restored to active
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  document_id:
+                    type: string
+                    format: uuid
+                  restored_version:
+                    type: integer
+                  superseded_version:
+                    type: integer
+        "400":
+          description: Invalid rollback target (already active, deleted, or missing)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Document not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # ---------------------------------------------------------------------------
+  # Scopes
+  # ---------------------------------------------------------------------------
+
+  /scopes:
+    get:
+      operationId: listScopes
+      tags: [Scopes]
+      summary: List all registered scopes
+      responses:
+        "200":
+          description: Scope list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  scopes:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Scope"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+    post:
+      operationId: createScope
+      tags: [Scopes]
+      summary: Create a new scope
+      description: |
+        Registers a new scope. Scope name must be in `{tenant}/{domain}` format.
+        Scope must exist before documents can be uploaded to it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scope_name]
+              properties:
+                scope_name:
+                  type: string
+                  pattern: "^[a-z0-9-]+/[a-z0-9-]+$"
+                  description: Scope identifier in {tenant}/{domain} format
+                  example: joblogic-kb/api-docs
+                description:
+                  type: string
+                  description: Human-readable description of this scope
+                owner:
+                  type: string
+                  description: Operator or team responsible for this scope
+      responses:
+        "201":
+          description: Scope created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Scope"
+        "409":
+          description: Scope already exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          description: Invalid scope_name format
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # ---------------------------------------------------------------------------
+  # Health
+  # ---------------------------------------------------------------------------
+
+  /health:
+    get:
+      operationId: health
+      tags: [Health]
+      summary: Service health check
+      responses:
+        "200":
+          description: Service healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+        "503":
+          description: Service unhealthy (dependency unavailable)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [degraded, unhealthy]
+                  detail:
+                    type: string
+
+# ---------------------------------------------------------------------------
+# Components
+# ---------------------------------------------------------------------------
+
+components:
+
+  schemas:
+
+    UploadResponse:
+      type: object
+      required: [job_id, document_id]
+      properties:
+        job_id:
+          type: string
+          format: uuid
+          description: Use this to poll GET /jobs/{job_id}
+        document_id:
+          type: string
+          format: uuid
+          description: Stable document identifier across all versions
+        scope:
+          type: string
+        version:
+          type: integer
+          description: Version number assigned to this upload
+        skipped:
+          type: boolean
+          default: false
+          description: True if ingest was skipped due to duplicate file hash
+
+    JobStatus:
+      type: object
+      required: [job_id, document_id, status]
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        document_id:
+          type: string
+          format: uuid
+        scope:
+          type: string
+        version:
+          type: integer
+        status:
+          type: string
+          enum:
+            - submitted
+            - normalizing
+            - normalized
+            - extracting
+            - extracted
+            - indexing
+            - active
+            - failed
+        stage:
+          type: string
+          description: Current pipeline stage detail
+        progress_percent:
+          type: integer
+          minimum: 0
+          maximum: 100
+        error_message:
+          type: string
+          nullable: true
+          description: Present when status = failed
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    DocumentSummary:
+      type: object
+      properties:
+        document_id:
+          type: string
+          format: uuid
+        filename:
+          type: string
+        format:
+          type: string
+          enum: [pdf, docx, html, markdown, txt]
+        scope:
+          type: string
+        version:
+          type: integer
+          description: Latest version number
+        status:
+          type: string
+          enum: [active, superseded, deleted, failed, indexing]
+        owner:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    DocumentVersion:
+      type: object
+      properties:
+        version:
+          type: integer
+        status:
+          type: string
+          enum: [active, superseded, deleted, failed]
+        source_hash:
+          type: string
+          description: SHA-256 of original file for this version
+        created_at:
+          type: string
+          format: date-time
+
+    Scope:
+      type: object
+      required: [scope_id, scope_name]
+      properties:
+        scope_id:
+          type: string
+          format: uuid
+        scope_name:
+          type: string
+          example: joblogic-kb/api-docs
+        description:
+          type: string
+          nullable: true
+        owner:
+          type: string
+          nullable: true
+        document_count:
+          type: integer
+          description: Number of active documents in this scope
+        created_at:
+          type: string
+          format: date-time
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Machine-readable error code
+          example: scope_not_found
+        detail:
+          type: string
+          description: Human-readable explanation
+          example: "Scope 'joblogic-kb/unknown' does not exist. Create it with POST /scopes."
+        request_id:
+          type: string
+          format: uuid
+          description: Trace ID for log correlation
+
+  responses:
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
