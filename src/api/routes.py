@@ -280,87 +280,443 @@ _OPERATOR_UI_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Agentopia Knowledge Ingest</title>
+  <title>Agentopia Knowledge Ingest — Operator</title>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; }
-    h1 { font-size: 1.4rem; border-bottom: 1px solid #ddd; padding-bottom: 8px; }
-    h2 { font-size: 1.1rem; margin-top: 32px; }
-    label { display: block; margin-bottom: 4px; font-weight: 500; font-size: 0.9rem; }
-    input, select { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px;
-                    font-size: 0.9rem; margin-bottom: 12px; box-sizing: border-box; }
-    button { background: #1a56db; color: white; border: none; padding: 10px 20px;
-             border-radius: 4px; cursor: pointer; font-size: 0.9rem; }
+    body { font-family: system-ui, sans-serif; max-width: 1000px; margin: 0 auto; padding: 20px; background: #f8f9fa; }
+    h1 { font-size: 1.3rem; border-bottom: 2px solid #1a56db; padding-bottom: 8px; margin-bottom: 0; color: #1a56db; }
+    h2 { font-size: 1.0rem; margin-top: 0; padding: 10px 16px; cursor: pointer; background: #fff; border: 1px solid #ddd; border-radius: 6px 6px 0 0; display: flex; justify-content: space-between; }
+    h2.open { background: #1a56db; color: #fff; }
+    .section { margin: 12px 0; }
+    .section-body { display: none; background: #fff; border: 1px solid #ddd; border-top: none; border-radius: 0 0 6px 6px; padding: 16px; }
+    .section-body.visible { display: block; }
+    label { display: block; margin-bottom: 3px; font-weight: 500; font-size: 0.85rem; color: #333; }
+    input, select, textarea { width: 100%; padding: 7px 10px; border: 1px solid #ccc; border-radius: 4px;
+                    font-size: 0.85rem; margin-bottom: 10px; box-sizing: border-box; font-family: inherit; }
+    textarea { height: 80px; resize: vertical; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    button { background: #1a56db; color: white; border: none; padding: 8px 16px;
+             border-radius: 4px; cursor: pointer; font-size: 0.85rem; margin-right: 6px; }
     button:hover { background: #1e429f; }
-    #status-box { background: #f4f4f4; padding: 16px; border-radius: 6px;
-                  font-family: monospace; font-size: 0.85rem; white-space: pre-wrap;
-                  min-height: 60px; margin-top: 12px; }
-    .label-active { color: #0f5132; font-weight: bold; }
-    .label-failed { color: #842029; font-weight: bold; }
-    .label-other  { color: #555; }
-    #upload-result { margin-top: 12px; font-size: 0.85rem; }
+    button.danger { background: #dc3545; }
+    button.danger:hover { background: #b02a37; }
+    button.secondary { background: #6c757d; }
+    button.secondary:hover { background: #5a6268; }
+    .output { background: #f4f4f4; padding: 12px; border-radius: 6px;
+              font-family: monospace; font-size: 0.8rem; white-space: pre-wrap;
+              min-height: 40px; margin-top: 8px; max-height: 300px; overflow-y: auto; word-break: break-all; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.75rem; font-weight: 600; }
+    .badge.active   { background: #d4edda; color: #155724; }
+    .badge.failed   { background: #f8d7da; color: #721c24; }
+    .badge.indexing { background: #cce5ff; color: #004085; }
+    .badge.other    { background: #e2e3e5; color: #383d41; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.82rem; margin-top: 8px; }
+    th { background: #f0f0f0; padding: 6px 10px; text-align: left; border-bottom: 2px solid #ddd; }
+    td { padding: 6px 10px; border-bottom: 1px solid #eee; }
+    tr:hover td { background: #fafafa; }
+    .verdict.passed  { color: #155724; font-weight: 600; }
+    .verdict.blocked { color: #721c24; font-weight: 600; }
+    .verdict.warning { color: #856404; font-weight: 600; }
+    .actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
   </style>
 </head>
 <body>
-  <h1>Agentopia — Knowledge Ingest</h1>
-  <h2>Upload Document</h2>
-  <form id="upload-form">
-    <label>Scope (e.g. joblogic-kb/api-docs)</label>
-    <input type="text" id="scope" placeholder="tenant/domain" required>
-    <label>Owner (optional)</label>
-    <input type="text" id="owner" placeholder="operator@example.com">
-    <label>Document (PDF, DOCX, HTML, Markdown)</label>
-    <input type="file" id="file" accept=".pdf,.docx,.html,.htm,.md,.markdown,.txt" required>
-    <button type="submit">Upload</button>
-  </form>
-  <div id="upload-result"></div>
-  <h2>Job Status</h2>
-  <input type="text" id="job-id" placeholder="Paste job_id here">
-  <button onclick="pollJob()">Check Status</button>
-  <div id="status-box">Status will appear here.</div>
+  <h1>Agentopia Knowledge Ingest &mdash; Operator Console</h1>
+
+  <!-- ── Upload ──────────────────────────────────────────────────── -->
+  <div class="section">
+    <h2 id="hUpload" onclick="toggle('sUpload','hUpload')">&#x2795; Upload Document</h2>
+    <div id="sUpload" class="section-body">
+      <div class="row">
+        <div>
+          <label>Scope (tenant/domain)</label>
+          <input id="upScope" placeholder="joblogic-kb/api-docs">
+          <label>Owner (optional)</label>
+          <input id="upOwner" placeholder="operator@example.com">
+          <label>Document (PDF, DOCX, HTML, Markdown)</label>
+          <input type="file" id="upFile" accept=".pdf,.docx,.html,.htm,.md,.markdown,.txt">
+          <button onclick="doUpload()">Upload</button>
+        </div>
+        <div>
+          <label>Job ID (auto-filled on upload)</label>
+          <input id="upJobId" placeholder="Paste job_id to check status">
+          <button onclick="pollJob()">Check Status</button>
+          <div id="upStatus" class="output">Ready.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Documents ──────────────────────────────────────────────── -->
+  <div class="section">
+    <h2 id="hDocs" onclick="toggle('sDocs','hDocs')">&#x1F4C4; Documents</h2>
+    <div id="sDocs" class="section-body">
+      <div style="display:flex;gap:8px;align-items:flex-end;margin-bottom:10px">
+        <div style="flex:1"><label>Scope</label><input id="docScope" placeholder="joblogic-kb/api-docs"></div>
+        <div><label>Status</label>
+          <select id="docStatus">
+            <option value="active">active</option>
+            <option value="superseded">superseded</option>
+            <option value="failed">failed</option>
+            <option value="all">all</option>
+          </select>
+        </div>
+        <div><button onclick="listDocs()">List</button></div>
+      </div>
+      <div id="docTable"></div>
+    </div>
+  </div>
+
+  <!-- ── Version History ────────────────────────────────────────── -->
+  <div class="section">
+    <h2 id="hVer" onclick="toggle('sVer','hVer')">&#x1F4CB; Version History &amp; Rollback</h2>
+    <div id="sVer" class="section-body">
+      <div style="display:flex;gap:8px;align-items:flex-end;margin-bottom:10px">
+        <div style="flex:1"><label>Document ID</label><input id="verDocId" placeholder="uuid"></div>
+        <button onclick="listVersions()">Load Versions</button>
+      </div>
+      <div id="verTable"></div>
+      <div id="rollbackSection" style="display:none;margin-top:12px">
+        <div style="display:flex;gap:8px;align-items:flex-end">
+          <div><label>Restore version</label><input id="rollbackVer" type="number" min="1" style="width:80px"></div>
+          <div style="flex:1"><label>Reason (optional)</label><input id="rollbackReason" placeholder="Prior version more accurate"></div>
+          <button class="danger" onclick="doRollback()">Rollback</button>
+        </div>
+        <div id="rollbackOut" class="output" style="display:none"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Scopes ─────────────────────────────────────────────────── -->
+  <div class="section">
+    <h2 id="hScopes" onclick="toggle('sScopes','hScopes')">&#x1F5C2; Scopes</h2>
+    <div id="sScopes" class="section-body">
+      <div style="display:flex;gap:8px;align-items:flex-end;margin-bottom:10px">
+        <button onclick="listScopes()">List All Scopes</button>
+        <span style="flex:1"></span>
+        <input id="newScope" placeholder="tenant/domain" style="width:200px">
+        <input id="newScopeOwner" placeholder="owner (optional)" style="width:160px">
+        <button onclick="createScope()">Create Scope</button>
+      </div>
+      <div id="scopeTable"></div>
+      <div id="scopeOut" class="output" style="display:none"></div>
+    </div>
+  </div>
+
+  <!-- ── Quality Dashboard ─────────────────────────────────────── -->
+  <div class="section">
+    <h2 id="hQual" onclick="toggle('sQual','hQual')">&#x1F4CA; Quality Dashboard</h2>
+    <div id="sQual" class="section-body">
+      <div style="margin-bottom:10px">
+        <button onclick="loadBaselines()">Load All Baselines</button>
+        <span id="baselineScope" style="margin-left:12px">
+          <input id="bsScope" placeholder="scope for results" style="width:220px;display:inline;margin-bottom:0">
+          <button onclick="loadResults()" class="secondary">Load Results</button>
+        </span>
+      </div>
+      <div id="baselineTable"></div>
+      <div id="resultsTable" style="margin-top:16px"></div>
+    </div>
+  </div>
+
+  <!-- ── Retrieval Debugger ─────────────────────────────────────── -->
+  <div class="section">
+    <h2 id="hDebug" onclick="toggle('sDebug','hDebug')">&#x1F50D; Retrieval Debugger</h2>
+    <div id="sDebug" class="section-body">
+      <p style="font-size:0.82rem;color:#555;margin-top:0">
+        Requires Super RAG URL and internal token. Results show ranked chunks with text, section path, score, and document lineage.
+      </p>
+      <div class="row">
+        <div>
+          <label>Super RAG URL</label>
+          <input id="dbgUrl" value="http://localhost:8002">
+          <label>Internal Token</label>
+          <input id="dbgToken" type="password" placeholder="SUPER_RAG_INTERNAL_TOKEN">
+        </div>
+        <div>
+          <label>Scope</label>
+          <input id="dbgScope" placeholder="joblogic-kb/api-docs">
+          <label>Query</label>
+          <input id="dbgQuery" placeholder="How do I authenticate?">
+          <button onclick="doDebug()">Run Query</button>
+        </div>
+      </div>
+      <div id="debugTable" style="margin-top:8px"></div>
+    </div>
+  </div>
+
   <script>
-    let pollInterval = null;
-    document.getElementById('upload-form').addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const scope = document.getElementById('scope').value.trim();
-      const owner = document.getElementById('owner').value.trim();
-      const file = document.getElementById('file').files[0];
-      if (!file) return;
-      const fd = new FormData();
-      fd.append('file', file);
-      document.getElementById('upload-result').textContent = 'Uploading...';
-      try {
-        const resp = await fetch(
-          `/documents/upload?scope=${encodeURIComponent(scope)}&owner=${encodeURIComponent(owner)}`,
-          { method: 'POST', body: fd }
-        );
-        const data = await resp.json();
-        if (!resp.ok) { document.getElementById('upload-result').textContent = 'Error: ' + (data.detail || resp.statusText); return; }
-        document.getElementById('upload-result').textContent =
-          `Accepted. job_id: ${data.job_id}  document_id: ${data.document_id}  v${data.version}`;
-        document.getElementById('job-id').value = data.job_id;
-        startPolling(data.job_id);
-      } catch (err) { document.getElementById('upload-result').textContent = 'Failed: ' + err; }
-    });
-    function pollJob() { const j = document.getElementById('job-id').value.trim(); if (j) startPolling(j); }
-    function startPolling(jobId) {
-      if (pollInterval) clearInterval(pollInterval);
-      fetchStatus(jobId);
-      pollInterval = setInterval(() => fetchStatus(jobId), 3000);
+  // ── Helpers ────────────────────────────────────────────────────────────────
+
+  function toggle(bodyId, headId) {
+    const b = document.getElementById(bodyId);
+    const h = document.getElementById(headId);
+    const open = b.classList.toggle('visible');
+    h.classList.toggle('open', open);
+    h.textContent = (open ? '▼ ' : '▶ ') + h.textContent.replace(/^[▼▶] /, '');
+  }
+
+  function badgeHtml(status) {
+    const cls = ['active','failed','indexing'].includes(status) ? status : 'other';
+    return `<span class="badge ${cls}">${status}</span>`;
+  }
+
+  function isoDate(ts) {
+    if (!ts) return '-';
+    return ts.replace('T', ' ').slice(0, 16);
+  }
+
+  async function api(path, opts = {}) {
+    const resp = await fetch(path, opts);
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+      throw new Error(err.detail || resp.statusText);
     }
-    async function fetchStatus(jobId) {
-      try {
-        const resp = await fetch(`/jobs/${jobId}`);
-        const data = await resp.json();
-        const s = data.status || '';
-        const cls = s === 'active' ? 'label-active' : s === 'failed' ? 'label-failed' : 'label-other';
-        document.getElementById('status-box').innerHTML =
-          `<span class="${cls}">${s.toUpperCase()}</span> (${data.progress_percent ?? 0}%)\\n` +
-          `scope: ${data.scope}  version: ${data.version}\\nstage: ${data.stage || '-'}\\n` +
-          (data.error_message ? `error: ${data.error_message}\\n` : '') +
-          `updated: ${data.updated_at || '-'}`;
-        if (s === 'active' || s === 'failed') clearInterval(pollInterval);
-      } catch (err) { clearInterval(pollInterval); }
-    }
+    return resp.json();
+  }
+
+  let pollInterval = null;
+
+  // ── Upload ─────────────────────────────────────────────────────────────────
+
+  async function doUpload() {
+    const scope = document.getElementById('upScope').value.trim();
+    const owner = document.getElementById('upOwner').value.trim();
+    const file = document.getElementById('upFile').files[0];
+    const statusEl = document.getElementById('upStatus');
+    if (!scope || !file) { statusEl.textContent = 'Scope and file are required.'; return; }
+    const fd = new FormData();
+    fd.append('file', file);
+    statusEl.textContent = 'Uploading...';
+    try {
+      const data = await fetch(
+        `/documents/upload?scope=${encodeURIComponent(scope)}&owner=${encodeURIComponent(owner)}`,
+        { method: 'POST', body: fd }
+      ).then(r => { if (!r.ok) throw new Error(r.statusText); return r.json(); });
+      document.getElementById('upJobId').value = data.job_id;
+      statusEl.textContent = `Accepted. job_id: ${data.job_id}\\ndocument_id: ${data.document_id}  v${data.version}`;
+      startPolling(data.job_id);
+    } catch (err) { statusEl.textContent = 'Error: ' + err.message; }
+  }
+
+  function pollJob() {
+    const j = document.getElementById('upJobId').value.trim();
+    if (j) startPolling(j);
+  }
+
+  function startPolling(jobId) {
+    if (pollInterval) clearInterval(pollInterval);
+    fetchStatus(jobId);
+    pollInterval = setInterval(() => fetchStatus(jobId), 3000);
+  }
+
+  async function fetchStatus(jobId) {
+    const el = document.getElementById('upStatus');
+    try {
+      const d = await api('/jobs/' + jobId);
+      const s = d.status || '';
+      el.textContent =
+        `${s.toUpperCase()} (${d.progress_percent ?? 0}%)\\n` +
+        `scope: ${d.scope}  v${d.version}  stage: ${d.stage || '-'}\\n` +
+        (d.error_message ? `error: ${d.error_message}\\n` : '') +
+        `updated: ${d.updated_at || '-'}`;
+      if (s === 'active' || s === 'failed') clearInterval(pollInterval);
+    } catch (e) { clearInterval(pollInterval); }
+  }
+
+  // ── Documents ──────────────────────────────────────────────────────────────
+
+  async function listDocs() {
+    const scope = document.getElementById('docScope').value.trim();
+    const status = document.getElementById('docStatus').value;
+    const el = document.getElementById('docTable');
+    if (!scope) { el.innerHTML = '<em>Enter a scope.</em>'; return; }
+    try {
+      const d = await api('/documents?scope=' + encodeURIComponent(scope) + '&status=' + status);
+      const docs = d.documents || [];
+      if (!docs.length) { el.innerHTML = '<em>No documents found.</em>'; return; }
+      el.innerHTML = '<table><thead><tr><th>Filename</th><th>Format</th><th>Version</th><th>Status</th><th>Updated</th><th>Actions</th></tr></thead><tbody>' +
+        docs.map(doc => `<tr>
+          <td style="font-family:monospace;font-size:0.78rem">${doc.filename}</td>
+          <td>${doc.format}</td>
+          <td>v${doc.version}</td>
+          <td>${badgeHtml(doc.status)}</td>
+          <td>${isoDate(doc.updated_at)}</td>
+          <td><button class="secondary" onclick="loadVersionsById('${doc.document_id}')">Versions</button></td>
+        </tr>`).join('') + '</tbody></table>';
+    } catch (e) { el.innerHTML = '<em>Error: ' + e.message + '</em>'; }
+  }
+
+  // ── Version History ────────────────────────────────────────────────────────
+
+  function loadVersionsById(docId) {
+    document.getElementById('verDocId').value = docId;
+    // open section
+    const b = document.getElementById('sVer');
+    if (!b.classList.contains('visible')) toggle('sVer', 'hVer');
+    listVersions();
+  }
+
+  async function listVersions() {
+    const docId = document.getElementById('verDocId').value.trim();
+    const el = document.getElementById('verTable');
+    const rs = document.getElementById('rollbackSection');
+    if (!docId) { el.innerHTML = '<em>Enter a document ID.</em>'; return; }
+    try {
+      const d = await api('/documents/' + docId + '/versions');
+      const vs = d.versions || [];
+      if (!vs.length) { el.innerHTML = '<em>No versions found.</em>'; return; }
+      el.innerHTML = '<table><thead><tr><th>Version</th><th>Status</th><th>Source Hash</th><th>Created</th></tr></thead><tbody>' +
+        vs.map(v => `<tr>
+          <td>v${v.version}</td>
+          <td>${badgeHtml(v.status)}</td>
+          <td style="font-family:monospace;font-size:0.72rem">${(v.source_hash||'').slice(0,16)}…</td>
+          <td>${isoDate(v.created_at)}</td>
+        </tr>`).join('') + '</tbody></table>';
+      rs.style.display = vs.length > 1 ? 'block' : 'none';
+    } catch (e) { el.innerHTML = '<em>Error: ' + e.message + '</em>'; }
+  }
+
+  async function doRollback() {
+    const docId = document.getElementById('verDocId').value.trim();
+    const version = parseInt(document.getElementById('rollbackVer').value);
+    const reason = document.getElementById('rollbackReason').value;
+    const out = document.getElementById('rollbackOut');
+    if (!docId || !version) { out.textContent = 'Document ID and version required.'; out.style.display = 'block'; return; }
+    if (!confirm('Roll back document to v' + version + '? Current active version will be superseded.')) return;
+    try {
+      const d = await api('/documents/' + docId + '/rollback', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ version, reason })
+      });
+      out.textContent = 'Rollback complete.\\nRestored: v' + d.restored_version + '\\nSuperseded: v' + d.superseded_version;
+      out.style.display = 'block';
+      listVersions();
+    } catch (e) { out.textContent = 'Error: ' + e.message; out.style.display = 'block'; }
+  }
+
+  // ── Scopes ─────────────────────────────────────────────────────────────────
+
+  async function listScopes() {
+    const el = document.getElementById('scopeTable');
+    try {
+      const d = await api('/scopes');
+      const scopes = d.scopes || [];
+      if (!scopes.length) { el.innerHTML = '<em>No scopes found.</em>'; return; }
+      el.innerHTML = '<table><thead><tr><th>Scope</th><th>Owner</th><th>Docs</th><th>Created</th></tr></thead><tbody>' +
+        scopes.map(s => `<tr>
+          <td style="font-family:monospace">${s.scope_name}</td>
+          <td>${s.owner || '-'}</td>
+          <td>${s.document_count ?? 0}</td>
+          <td>${isoDate(s.created_at)}</td>
+        </tr>`).join('') + '</tbody></table>';
+    } catch (e) { el.innerHTML = '<em>Error: ' + e.message + '</em>'; }
+  }
+
+  async function createScope() {
+    const name = document.getElementById('newScope').value.trim();
+    const owner = document.getElementById('newScopeOwner').value.trim();
+    const out = document.getElementById('scopeOut');
+    if (!name) { out.textContent = 'Scope name required.'; out.style.display = 'block'; return; }
+    try {
+      const d = await api('/scopes', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ scope_name: name, owner })
+      });
+      out.textContent = 'Created: ' + d.scope_name + ' (id: ' + d.scope_id + ')';
+      out.style.display = 'block';
+      listScopes();
+    } catch (e) { out.textContent = 'Error: ' + e.message; out.style.display = 'block'; }
+  }
+
+  // ── Quality Dashboard ──────────────────────────────────────────────────────
+
+  async function loadBaselines() {
+    const el = document.getElementById('baselineTable');
+    const superRagUrl = document.getElementById('dbgUrl').value.trim() || 'http://localhost:8002';
+    const token = document.getElementById('dbgToken').value;
+    try {
+      const resp = await fetch(superRagUrl + '/api/v1/evaluation/baselines',
+        { headers: { 'X-Internal-Token': token } });
+      const d = await resp.json();
+      const bs = d.baselines || [];
+      if (!bs.length) { el.innerHTML = '<em>No baselines established yet. Use POST /evaluation/baselines/{scope} in Super RAG.</em>'; return; }
+      el.innerHTML = '<table><thead><tr><th>Scope</th><th>nDCG@5</th><th>MRR</th><th>P@5</th><th>R@5</th><th>Questions</th><th>Established</th></tr></thead><tbody>' +
+        bs.map(b => `<tr>
+          <td style="font-family:monospace;font-size:0.78rem">${b.scope}</td>
+          <td>${(b.ndcg_5||0).toFixed(4)}</td>
+          <td>${(b.mrr||0).toFixed(4)}</td>
+          <td>${(b.p_5||0).toFixed(4)}</td>
+          <td>${(b.r_5||0).toFixed(4)}</td>
+          <td>${b.golden_question_count}</td>
+          <td>${isoDate(b.established_at)}</td>
+        </tr>`).join('') + '</tbody></table>';
+    } catch (e) { el.innerHTML = '<em>Error loading baselines: ' + e.message + '</em>'; }
+  }
+
+  async function loadResults() {
+    const scope = document.getElementById('bsScope').value.trim();
+    const el = document.getElementById('resultsTable');
+    const superRagUrl = document.getElementById('dbgUrl').value.trim() || 'http://localhost:8002';
+    const token = document.getElementById('dbgToken').value;
+    if (!scope) { el.innerHTML = '<em>Enter scope above.</em>'; return; }
+    try {
+      const resp = await fetch(
+        superRagUrl + '/api/v1/evaluation/results?scope=' + encodeURIComponent(scope),
+        { headers: { 'X-Internal-Token': token } }
+      );
+      const d = await resp.json();
+      const rs = d.results || [];
+      if (!rs.length) { el.innerHTML = '<em>No evaluation results for this scope.</em>'; return; }
+      el.innerHTML = '<h3 style="font-size:0.9rem;margin:0 0 6px">Recent Evaluation Results — ' + scope + '</h3>' +
+        '<table><thead><tr><th>Run At</th><th>Trigger</th><th>nDCG@5</th><th>Delta</th><th>Verdict</th><th>Override</th></tr></thead><tbody>' +
+        rs.map(r => {
+          const vc = r.verdict === 'passed' ? 'passed' : r.verdict === 'blocked' || r.verdict === 'eval_error' ? 'blocked' : 'warning';
+          const delta = r.delta_ndcg_5 != null ? (r.delta_ndcg_5 >= 0 ? '+' : '') + r.delta_ndcg_5.toFixed(4) : '-';
+          const override = r.operator_override ? '✓ ' + (r.operator_identity || '') : '-';
+          return `<tr>
+            <td>${isoDate(r.run_at)}</td>
+            <td>${r.trigger}</td>
+            <td>${r.ndcg_5 != null ? r.ndcg_5.toFixed(4) : '-'}</td>
+            <td>${delta}</td>
+            <td><span class="verdict ${vc}">${r.verdict}</span></td>
+            <td style="font-size:0.78rem">${override}</td>
+          </tr>`;
+        }).join('') + '</tbody></table>';
+    } catch (e) { el.innerHTML = '<em>Error: ' + e.message + '</em>'; }
+  }
+
+  // ── Retrieval Debugger ─────────────────────────────────────────────────────
+
+  async function doDebug() {
+    const url = document.getElementById('dbgUrl').value.trim();
+    const token = document.getElementById('dbgToken').value;
+    const scope = document.getElementById('dbgScope').value.trim();
+    const q = document.getElementById('dbgQuery').value.trim();
+    const el = document.getElementById('debugTable');
+    if (!url || !scope || !q) { el.innerHTML = '<em>URL, scope, and query are required.</em>'; return; }
+    try {
+      const resp = await fetch(
+        url + '/api/v1/knowledge/debug/query?scope=' + encodeURIComponent(scope) +
+        '&q=' + encodeURIComponent(q) + '&limit=10',
+        { headers: { 'X-Internal-Token': token } }
+      );
+      if (!resp.ok) { const e = await resp.json(); throw new Error(e.detail || resp.statusText); }
+      const d = await resp.json();
+      const results = d.results || [];
+      if (!results.length) { el.innerHTML = '<em>No results returned.</em>'; return; }
+      el.innerHTML = '<table><thead><tr><th>#</th><th>Score</th><th>Source</th><th>Section</th><th>Chunk</th><th>Text (preview)</th></tr></thead><tbody>' +
+        results.map(r => `<tr>
+          <td>${r.rank}</td>
+          <td style="font-family:monospace">${r.score.toFixed(4)}</td>
+          <td style="font-family:monospace;font-size:0.75rem;max-width:160px;overflow:hidden;text-overflow:ellipsis">${r.source}</td>
+          <td style="font-size:0.78rem;max-width:140px">${r.section_path || r.section || '-'}</td>
+          <td>${r.chunk_index}</td>
+          <td style="font-size:0.78rem;max-width:260px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${r.text.replace(/"/g,'&quot;')}">${r.text.slice(0,120)}${r.text.length>120?'…':''}</td>
+        </tr>`).join('') + '</tbody></table>';
+    } catch (e) { el.innerHTML = '<em>Error: ' + e.message + '</em>'; }
+  }
   </script>
 </body>
 </html>
