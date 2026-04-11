@@ -234,7 +234,96 @@ If a document you expect in results is not appearing:
 
 ---
 
-## 10. Common Operations Quick Reference
+## 10. Configure Connector Scope Mapping
+
+Connector integrations (OpenRAG, Confluence, etc.) automatically route documents into
+knowledge scopes based on mapping rules you configure. Without a mapping, the
+connector must supply the scope explicitly on each event, or ingestion fails.
+
+### Why this matters
+
+Each connector module pushes documents from an external source. The scope mapping
+determines **which knowledge scope** receives those documents. Misconfigured or
+missing mappings cause ingest to fail with `fetch_failed` verdict and the error:
+
+```
+Scope 'X' is not registered in the knowledge registry.
+Create the scope via POST /scopes before connector ingestion proceeds.
+```
+
+### Configuration options (pick one)
+
+**Option A — Environment variable** (recommended for Kubernetes):
+
+```bash
+export CONNECTOR_SCOPE_MAPPINGS='[
+  {"connector_module": "openrag", "source_pattern": "joblogic/*",   "scope": "joblogic-kb/docs"},
+  {"connector_module": "openrag", "source_pattern": "portal/*",     "scope": "portal-kb/docs"},
+  {"connector_module": "openrag", "source_pattern": "*",            "scope": "default-kb/general"}
+]'
+```
+
+**Option B — Config file** (recommended for many rules):
+
+```bash
+export CONNECTOR_SCOPE_MAPPINGS_FILE=/etc/agentopia/connector-scopes.json
+```
+
+```json
+[
+  {"connector_module": "openrag", "source_pattern": "joblogic/*",   "scope": "joblogic-kb/docs"},
+  {"connector_module": "openrag", "source_pattern": "portal/*",     "scope": "portal-kb/docs"},
+  {"connector_module": "openrag", "source_pattern": "*",            "scope": "default-kb/general"}
+]
+```
+
+If both are set, the env var takes precedence. If neither is set, connectors must
+supply `event.scope` directly (usable from code; not the normal operator flow).
+
+### Rule format
+
+| Field | Description |
+|---|---|
+| `connector_module` | Exact connector identifier (e.g. `"openrag"`, `"confluence"`) |
+| `source_pattern` | fnmatch glob applied to the document's `source_uri` |
+| `scope` | Target scope name — must be registered via `POST /scopes` first |
+
+Rules are evaluated in order. **First match wins.** Add a wildcard catch-all (`*`)
+as the last rule to ensure every document lands somewhere.
+
+### Setup checklist
+
+1. Create the target scope(s) first:
+   ```bash
+   curl -X POST http://localhost:8003/scopes \
+     -H "Content-Type: application/json" \
+     -d '{"scope_name": "joblogic-kb/docs", "description": "Joblogic docs", "owner": "operator@example.com"}'
+   ```
+
+2. Set the mapping configuration (env var or file).
+
+3. Restart or reload the ingest service to pick up new rules.
+   To reload without restart (in a running process), the service exposes no reload endpoint
+   in Phase 1 — restart is required for config changes.
+
+4. Verify a sync task reaches `fetched` status:
+   ```bash
+   # connector_sync_tasks are viewable via operator console at /ui
+   # or check the ingest job for the document_id
+   curl http://localhost:8003/jobs/<job_id>
+   ```
+
+### Troubleshooting scope mapping failures
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `fetch_failed` with "Scope not registered" | Scope name in mapping doesn't match a registered scope | Create scope via `POST /scopes` |
+| `fetch_failed` with "No scope could be resolved" | No mapping matches and `event.scope` is empty | Add a wildcard catch-all rule or set `event.scope` |
+| Documents land in wrong scope | Rule order wrong | Move more-specific rules before the wildcard |
+
+---
+
+## 11. Common Operations Quick Reference
 
 | Task | Command |
 |---|---|
@@ -249,6 +338,8 @@ If a document you expect in results is not appearing:
 | Establish baseline | `POST /evaluation/baselines/{scope}` (Super RAG) |
 | Override regression block | `POST /evaluation/results/{id}/override` (Super RAG) |
 | Debug retrieval | `GET /knowledge/debug/query?scope=...&q=...` (Super RAG) |
+| Configure scope mapping (env) | `CONNECTOR_SCOPE_MAPPINGS='[...]'` |
+| Configure scope mapping (file) | `CONNECTOR_SCOPE_MAPPINGS_FILE=/path/to/rules.json` |
 
 ---
 

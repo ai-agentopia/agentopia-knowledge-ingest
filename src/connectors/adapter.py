@@ -155,6 +155,32 @@ def ingest_from_connector(event: ConnectorEvent) -> SyncResult:
         connector_module, source_uri, scope, resolved is not None,
     )
 
+    # ── Step 0b: Validate scope is registered ─────────────────────────────────
+    # The resolved scope must exist in the scope registry. An unregistered scope
+    # would make all document rows and chunk payloads land in a phantom scope that
+    # Super RAG has no record of. Fail early with a clear operator-actionable error.
+    if not registry.scope_exists(scope):
+        error_msg = (
+            f"Scope '{scope}' is not registered in the knowledge registry. "
+            f"Create the scope via POST /scopes before connector ingestion proceeds."
+        )
+        logger.error(
+            "connector_adapter: fetch_failed — unregistered scope=%s connector=%s uri=%s",
+            scope, connector_module, source_uri,
+        )
+        task_id = create_sync_task(
+            connector_module=connector_module,
+            scope=scope,
+            source_uri=source_uri,
+        )
+        mark_fetching(task_id)
+        set_verdict(task_id, verdict="fetch_failed", error_message=error_msg)
+        return SyncResult(
+            task_id=task_id,
+            verdict="fetch_failed",
+            error_message=error_msg,
+        )
+
     # ── Step 1: Create sync task (queued) ─────────────────────────────────────
     task_id = create_sync_task(
         connector_module=connector_module,

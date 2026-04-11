@@ -73,8 +73,8 @@ CREATE TABLE IF NOT EXISTS connector_sync_tasks (
     -- Set for ALL verdicts where a document_id can be computed — including
     -- skipped_unchanged (the document exists; we just did not create a new version).
     -- NULL only for fetch_failed where source_uri validation itself fails.
-    resulting_row_id         BIGINT,
-    -- The row_id (surrogate PK) of the documents row created/updated by this sync.
+    resulting_row_id         BIGINT REFERENCES documents(row_id),
+    -- FK to the documents row created/updated by this sync.
     -- Populated for fetched_new and fetched_updated verdicts only.
     -- NULL for skipped_unchanged (no new document row written) and fetch_failed.
     -- Allows direct join to documents without going through document_id + version.
@@ -83,8 +83,31 @@ CREATE TABLE IF NOT EXISTS connector_sync_tasks (
     -- NULL for skipped_unchanged and fetch_failed.
     error_message            TEXT,
     created_at               TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    updated_at               TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    updated_at               TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    completed_at             TIMESTAMPTZ
+    -- Set when status reaches a terminal state: fetched or failed.
+    -- NULL while task is queued or fetching.
 );
+
+-- ── Idempotent additions for installations where connector_sync_tasks already
+-- exists (created before completed_at and the FK were introduced). ────────────
+
+ALTER TABLE connector_sync_tasks ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+
+-- Add FK on resulting_row_id if not already present.
+-- PostgreSQL has no ADD FOREIGN KEY IF NOT EXISTS; use a DO block.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'connector_sync_tasks_resulting_row_id_fkey'
+    ) THEN
+        ALTER TABLE connector_sync_tasks
+            ADD CONSTRAINT connector_sync_tasks_resulting_row_id_fkey
+            FOREIGN KEY (resulting_row_id) REFERENCES documents(row_id);
+    END IF;
+END
+$$;
 
 CREATE INDEX IF NOT EXISTS idx_connector_sync_module_scope
     ON connector_sync_tasks(connector_module, scope);
