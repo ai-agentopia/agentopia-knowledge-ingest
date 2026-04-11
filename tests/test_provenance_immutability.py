@@ -112,6 +112,46 @@ class TestSourceRevisionImmutability(unittest.TestCase):
             "sync tasks must record the observed revision here",
         )
 
+    def test_connector_sync_has_source_hash_observed(self):
+        """connector_sync.py must reference source_hash_observed (dedup evidence field)."""
+        source = self._connector_sync_source()
+        self.assertIn(
+            "source_hash_observed",
+            source,
+            "connector_sync.py must reference source_hash_observed — "
+            "the dedup evidence field that records what hash was seen at sync time",
+        )
+
+    def test_connector_sync_has_resulting_row_id(self):
+        """connector_sync.py must reference resulting_row_id (document row linkage field)."""
+        source = self._connector_sync_source()
+        self.assertIn(
+            "resulting_row_id",
+            source,
+            "connector_sync.py must reference resulting_row_id — "
+            "the FK to documents.row_id for fetched_new / fetched_updated verdicts",
+        )
+
+    def test_sql_migration_has_source_hash_observed(self):
+        """db/002_connectors.sql must define source_hash_observed column."""
+        sql_path = pathlib.Path(__file__).parent.parent / "db" / "002_connectors.sql"
+        self.assertTrue(sql_path.exists())
+        self.assertIn(
+            "source_hash_observed",
+            sql_path.read_text(),
+            "002_connectors.sql must define source_hash_observed column on connector_sync_tasks",
+        )
+
+    def test_sql_migration_has_resulting_row_id(self):
+        """db/002_connectors.sql must define resulting_row_id column."""
+        sql_path = pathlib.Path(__file__).parent.parent / "db" / "002_connectors.sql"
+        self.assertTrue(sql_path.exists())
+        self.assertIn(
+            "resulting_row_id",
+            sql_path.read_text(),
+            "002_connectors.sql must define resulting_row_id column on connector_sync_tasks",
+        )
+
     def test_adapter_sets_source_revision_on_create_document_only(self):
         """adapter.py must pass source_revision to create_document, not to any UPDATE."""
         adapter_path = _SRC / "connectors" / "adapter.py"

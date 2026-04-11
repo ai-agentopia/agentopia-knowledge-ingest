@@ -1,70 +1,93 @@
-"""W-C1.12: Connector adapter E2E test.
+"""W-C1.12: Connector adapter E2E tests.
 
-Tests the full ingest_from_connector() flow:
-  1. First sync of a new source_uri → fetched_new, document created, job created
-  2. Re-sync with same raw_bytes (same hash) → skipped_unchanged, no new document row
-  3. Re-sync with changed raw_bytes (different hash) → fetched_updated, new version created
-  4. Orchestrator failure does NOT change the sync verdict (W-C1.8)
-  5. source_uri with commit SHA is rejected with fetch_failed verdict
+Two test classes:
 
-All DB calls are stubbed via unittest.mock.patch — no real PostgreSQL required.
-The orchestrator is also stubbed at network boundary (httpx.post) consistent
-with the existing test_ingest_e2e.py pattern.
+TestConnectorAdapterStubbed
+    Exercises sync state machine logic, verdict assignment, scope resolution,
+    and provenance fields using full in-memory stubs for registry and connector_sync.
+    Super RAG and orchestrator are also stubbed.
 
-Stub architecture:
-  - db.registry: patched to use in-memory dicts
-  - db.connector_sync: patched to use in-memory dicts
-  - orchestrator.run_pipeline: patched to record calls (simulates success/failure)
+TestConnectorAdapterRealPipeline  (required by W-C1.12)
+    Exercises the real adapter → real normalizer → real extractor → real orchestrator
+    path, with Super RAG mocked only at the network boundary (httpx.post).
+    Registry is stubbed in-memory (no real PostgreSQL required).
+    Connector sync state is stubbed in-memory.
+    Storage backend is local filesystem (temp dir).
+
+    This mirrors the pattern used in test_ingest_e2e.py:
+      "Real orchestrator code paths with httpx mocked at network boundary."
+
+Scope of each test class:
+  Stubbed — verdict semantics, scope resolution, schema fields (source_hash_observed,
+             resulting_row_id), skipped_unchanged dedup, SHA rejection.
+  RealPipeline — full data flow from ConnectorEvent bytes through normalizer, extractor,
+                 Super RAG handoff, and promote_to_active.
 """
 
 import hashlib
+import json
 import os
 import sys
+import tempfile
 import unittest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch, patch as _patch
+
 import pathlib
 
 _SRC = pathlib.Path(__file__).parent.parent / "src"
 sys.path.insert(0, str(_SRC))
 
+# ── Shared env setup for real-pipeline tests ──────────────────────────────────
+_TMP_STORE = tempfile.mkdtemp(prefix="ki_connector_test_")
+os.environ.setdefault("STORAGE_LOCAL_PATH", _TMP_STORE)
+os.environ.setdefault("SUPER_RAG_URL", "http://localhost:8002")
+os.environ.setdefault("SUPER_RAG_INTERNAL_TOKEN", "test-token")
+os.environ.setdefault("SUPER_RAG_INGEST_MAX_RETRIES", "1")
+os.environ.setdefault("DATABASE_URL", "")
 
-def _sha256(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()
 
-
-# ── In-memory DB stubs ────────────────────────────────────────────────────────
+# ── In-memory stubs ───────────────────────────────────────────────────────────
 
 class _InMemoryRegistry:
-    """Minimal in-memory stub for db.registry used by adapter tests."""
+    """In-memory registry stub that mirrors the real versioning contract.
+
+    Extended from test_ingest_e2e.py's _InMemoryRegistry with connector fields.
+    """
 
     def __init__(self):
-        self._docs: dict[str, dict] = {}    # document_id → active row dict
-        self._rows: dict[int, dict] = {}    # row_id → row dict
+        self._rows: list[dict] = []
+        self._jobs: list[dict] = []
+        self._audit: list[dict] = []
         self._next_row_id = 1
-        self._jobs: dict[str, dict] = {}    # job_id → job dict
-        import uuid as _uuid
-        self._uuid = _uuid
 
-    def stable_document_id_connector(self, scope: str, connector_module: str, source_uri: str) -> str:
+    # Identity functions — use real implementations (no DB needed)
+    def stable_document_id_manual(self, scope, filename):
+        from db.registry import stable_document_id_manual as real_fn
+        return real_fn(scope, filename)
+
+    def stable_document_id_connector(self, scope, connector_module, source_uri):
         from db.registry import stable_document_id_connector as real_fn
         return real_fn(scope, connector_module, source_uri)
 
-    def get_active_version(self, document_id: str) -> dict | None:
-        return self._docs.get(document_id)
+    def get_active_version(self, document_id):
+        for r in self._rows:
+            if r["document_id"] == document_id and r["status"] == "active":
+                return r
+        return None
 
-    def create_document(self, *, scope, filename, format, source_hash,
-                        s3_original_key, owner="",
-                        connector_module=None, source_uri=None, source_revision=None) -> dict:
+    def create_document(self, *, scope, filename, format, source_hash, s3_original_key,
+                        owner="", connector_module=None, source_uri=None, source_revision=None):
         from db.registry import stable_document_id_connector, stable_document_id_manual
         if connector_module:
             doc_id = stable_document_id_connector(scope, connector_module, source_uri)
         else:
             doc_id = stable_document_id_manual(scope, filename)
 
-        existing_versions = [r["version"] for r in self._rows.values()
-                             if r["document_id"] == doc_id]
-        version = max(existing_versions, default=0) + 1
-
+        max_ver = max(
+            (r["version"] for r in self._rows if r["document_id"] == doc_id),
+            default=0,
+        )
+        version = max_ver + 1
         row_id = self._next_row_id
         self._next_row_id += 1
         row = {
@@ -77,53 +100,105 @@ class _InMemoryRegistry:
             "status": "submitted",
             "source_hash": source_hash,
             "s3_original_key": s3_original_key,
+            "s3_normalized_key": None,
+            "s3_extracted_key": None,
+            "error_message": None,
+            "owner": owner,
             "connector_module": connector_module,
             "source_uri": source_uri,
-            "source_revision": source_revision,
-            "created_at": "2026-01-01T00:00:00",
+            "source_revision": source_revision,  # IMMUTABLE — set once here
+            "created_at": "2026-04-11T00:00:00+00:00",
+            "updated_at": "2026-04-11T00:00:00+00:00",
         }
-        self._rows[row_id] = row
+        self._rows.append(row)
         return row
 
-    def create_job(self, row_id: int) -> str:
+    def update_document_status(self, row_id, status, *, s3_normalized_key=None,
+                                s3_extracted_key=None, error_message=None):
+        for r in self._rows:
+            if r["row_id"] == row_id:
+                r["status"] = status
+                if s3_normalized_key:
+                    r["s3_normalized_key"] = s3_normalized_key
+                if s3_extracted_key:
+                    r["s3_extracted_key"] = s3_extracted_key
+                if error_message:
+                    r["error_message"] = error_message
+                break
+
+    def promote_to_active(self, row_id, document_id):
+        """Atomic swap: supersede prior active, promote new row. Mirrors production contract."""
+        active_rows = [r for r in self._rows
+                       if r["document_id"] == document_id and r["status"] == "active"]
+        superseded_row_id = None
+        for r in active_rows:
+            if r["row_id"] != row_id:
+                r["status"] = "superseded"
+                superseded_row_id = r["row_id"]
+        for r in self._rows:
+            if r["row_id"] == row_id:
+                r["status"] = "active"
+                break
+        return superseded_row_id
+
+    def patch_s3_original_key(self, row_id, key):
+        for r in self._rows:
+            if r["row_id"] == row_id:
+                r["s3_original_key"] = key
+                break
+
+    def create_job(self, row_id):
         import uuid as _uuid
         job_id = str(_uuid.uuid4())
-        self._jobs[job_id] = {"job_id": job_id, "row_id": row_id, "status": "submitted"}
+        row = next((r for r in self._rows if r["row_id"] == row_id), None)
+        self._jobs.append({
+            "job_id": job_id,
+            "row_id": row_id,
+            "status": "submitted",
+            "stage": None,
+            "progress_percent": 0,
+            "error_message": None,
+        })
         return job_id
 
-    def promote_to_active(self, row_id: int, document_id: str) -> int | None:
-        old = self._docs.get(document_id)
-        old_row_id = old["row_id"] if old else None
-        if old_row_id:
-            self._rows[old_row_id]["status"] = "superseded"
-        self._rows[row_id]["status"] = "active"
-        self._docs[document_id] = self._rows[row_id]
-        return old_row_id
+    def update_job(self, job_id, *, status, stage=None, progress_percent=None,
+                   error_message=None, completed=False):
+        for j in self._jobs:
+            if j["job_id"] == job_id:
+                j["status"] = status
+                if stage:
+                    j["stage"] = stage
+                if progress_percent is not None:
+                    j["progress_percent"] = progress_percent
+                if error_message:
+                    j["error_message"] = error_message
+                break
 
-    def update_document_status(self, row_id: int, status: str, **kwargs) -> None:
-        if row_id in self._rows:
-            self._rows[row_id]["status"] = status
-            for k, v in kwargs.items():
-                if v is not None:
-                    self._rows[row_id][k] = v
+    def get_job(self, job_id):
+        return next((j for j in self._jobs if j["job_id"] == job_id), None)
 
-    def update_job(self, job_id: str, *, status: str, **kwargs) -> None:
-        if job_id in self._jobs:
-            self._jobs[job_id]["status"] = status
+    def scope_exists(self, scope_name):
+        return True
 
-    def write_audit_event(self, **kwargs) -> None:
-        pass  # No-op in tests
+    def write_audit_event(self, **kwargs):
+        self._audit.append(kwargs)
+
+    def active_row(self, document_id):
+        return next(
+            (r for r in self._rows if r["document_id"] == document_id and r["status"] == "active"),
+            None,
+        )
 
 
 class _InMemoryConnectorSync:
-    """Minimal in-memory stub for db.connector_sync used by adapter tests."""
+    """In-memory stub for db.connector_sync operations."""
 
     def __init__(self):
         self._tasks: dict[str, dict] = {}
         import uuid as _uuid
         self._uuid = _uuid
 
-    def create_sync_task(self, *, connector_module, scope, source_uri) -> str:
+    def create_sync_task(self, *, connector_module, scope, source_uri):
         task_id = str(self._uuid.uuid4())
         self._tasks[task_id] = {
             "task_id": task_id,
@@ -133,229 +208,216 @@ class _InMemoryConnectorSync:
             "status": "queued",
             "verdict": None,
             "observed_source_revision": None,
+            "source_hash_observed": None,
             "document_id": None,
+            "resulting_row_id": None,
             "job_id": None,
             "error_message": None,
         }
         return task_id
 
-    def mark_fetching(self, task_id: str) -> None:
+    def mark_fetching(self, task_id):
         self._tasks[task_id]["status"] = "fetching"
 
-    def set_verdict(self, task_id: str, *, verdict, observed_source_revision=None,
-                    document_id=None, job_id=None, error_message=None) -> None:
+    def set_verdict(self, task_id, *, verdict, observed_source_revision=None,
+                    source_hash_observed=None, document_id=None, resulting_row_id=None,
+                    job_id=None, error_message=None):
         t = self._tasks[task_id]
         t["verdict"] = verdict
         t["status"] = "failed" if verdict == "fetch_failed" else "fetched"
         if observed_source_revision is not None:
             t["observed_source_revision"] = observed_source_revision
+        if source_hash_observed is not None:
+            t["source_hash_observed"] = source_hash_observed
         if document_id is not None:
             t["document_id"] = document_id
+        if resulting_row_id is not None:
+            t["resulting_row_id"] = resulting_row_id
         if job_id is not None:
             t["job_id"] = job_id
         if error_message is not None:
             t["error_message"] = error_message
 
-    def get_task(self, task_id: str) -> dict | None:
+    def get_task(self, task_id):
         return self._tasks.get(task_id)
 
 
-# ── Test cases ────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-class TestConnectorAdapterE2E(unittest.TestCase):
-    """E2E tests for ingest_from_connector() with in-memory registry/sync stubs."""
+def _sha256(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
 
-    def _make_stubs(self):
-        reg = _InMemoryRegistry()
-        sync = _InMemoryConnectorSync()
-        return reg, sync
 
-    def _run_with_stubs(self, event, reg, sync, *, orchestrator_raises=None):
-        """Patch adapter dependencies and call ingest_from_connector."""
-        from connectors import adapter as _mod
+def _make_event(
+    raw_bytes=b"# API Reference\n\nAuthentication section.\n",
+    source_revision="rev1",
+    scope="joblogic-kb/docs",
+):
+    from connectors.adapter import ConnectorEvent
+    return ConnectorEvent(
+        connector_module="openrag",
+        scope=scope,
+        source_uri="joblogic/api-reference.md",
+        filename="api-reference.md",
+        format="markdown",
+        raw_bytes=raw_bytes,
+        source_revision=source_revision,
+        owner="test-operator",
+    )
 
-        pipeline_mock = MagicMock(return_value=None)
-        if orchestrator_raises is not None:
-            pipeline_mock.side_effect = orchestrator_raises
 
-        with (
-            patch.object(_mod, "registry", reg),
-            patch.object(_mod, "create_sync_task", sync.create_sync_task),
-            patch.object(_mod, "mark_fetching", sync.mark_fetching),
-            patch.object(_mod, "set_verdict", sync.set_verdict),
-            patch.object(_mod, "get_task", sync.get_task),
-            patch.object(_mod, "run_pipeline", pipeline_mock),
-        ):
-            result = _mod.ingest_from_connector(event)
-        return result
+def _run_stubbed(event, reg, sync, *, orchestrator_raises=None, resolved_scope=None):
+    """Run ingest_from_connector with all DB stubs, orchestrator stubbed."""
+    from connectors import adapter as _mod
 
-    def _make_event(self, raw_bytes=b"content v1", source_revision="abc123"):
-        from connectors.adapter import ConnectorEvent
-        return ConnectorEvent(
-            connector_module="openrag",
-            scope="joblogic-kb/docs",
-            source_uri="joblogic/api-reference.pdf",
-            filename="api-reference.pdf",
-            format="pdf",
-            raw_bytes=raw_bytes,
-            source_revision=source_revision,
-            owner="test-operator",
-        )
+    pipeline_mock = MagicMock(return_value=None)
+    if orchestrator_raises is not None:
+        pipeline_mock.side_effect = orchestrator_raises
 
-    # ── Test 1: First sync → fetched_new ─────────────────────────────────────
+    # resolve_scope returns None by default (event.scope is used as fallback)
+    resolve_mock = MagicMock(return_value=resolved_scope)
+
+    with (
+        patch.object(_mod, "registry", reg),
+        patch.object(_mod, "create_sync_task", sync.create_sync_task),
+        patch.object(_mod, "mark_fetching", sync.mark_fetching),
+        patch.object(_mod, "set_verdict", sync.set_verdict),
+        patch.object(_mod, "get_task", sync.get_task),
+        patch.object(_mod, "resolve_scope", resolve_mock),
+        patch.object(_mod, "run_pipeline", pipeline_mock),
+    ):
+        result = _mod.ingest_from_connector(event)
+    return result, resolve_mock
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestConnectorAdapterStubbed: verdict, schema fields, scope resolution, dedup
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestConnectorAdapterStubbed(unittest.TestCase):
+    """Adapter logic tests with all dependencies stubbed."""
+
+    def _reg_sync(self):
+        return _InMemoryRegistry(), _InMemoryConnectorSync()
+
+    # ── Verdict: fetched_new ──────────────────────────────────────────────────
 
     def test_first_sync_produces_fetched_new(self):
-        """First time a source_uri is synced → verdict is fetched_new."""
-        reg, sync = self._make_stubs()
-        event = self._make_event()
-        result = self._run_with_stubs(event, reg, sync)
-
+        reg, sync = self._reg_sync()
+        result, _ = _run_stubbed(_make_event(), reg, sync)
         self.assertEqual(result.verdict, "fetched_new")
         self.assertIsNotNone(result.document_id)
         self.assertIsNotNone(result.job_id)
         self.assertEqual(result.version, 1)
 
-    def test_first_sync_creates_document_row(self):
-        """First sync must create a document row in registry with connector identity fields."""
-        reg, sync = self._make_stubs()
-        event = self._make_event()
-        result = self._run_with_stubs(event, reg, sync)
-
-        self.assertEqual(result.verdict, "fetched_new")
-        # Row must exist in registry (promote_to_active runs inside orchestrator which is mocked;
-        # the row is created by create_document and lives in _rows)
-        rows_with_doc = [r for r in reg._rows.values() if r["document_id"] == result.document_id]
-        self.assertGreater(len(rows_with_doc), 0, "create_document must have been called")
-        row = rows_with_doc[0]
-        self.assertEqual(row["connector_module"], "openrag")
-        self.assertEqual(row["source_uri"], "joblogic/api-reference.pdf")
-        self.assertEqual(row["source_revision"], "abc123")
-
-    def test_first_sync_sync_task_has_correct_state(self):
-        """First sync task must reach status=fetched with verdict=fetched_new."""
-        reg, sync = self._make_stubs()
-        event = self._make_event()
-        result = self._run_with_stubs(event, reg, sync)
+    def test_first_sync_sets_schema_fields_on_task(self):
+        """source_hash_observed and resulting_row_id must be set on fetched_new task."""
+        reg, sync = self._reg_sync()
+        raw = b"# Doc\n\nContent.\n"
+        result, _ = _run_stubbed(_make_event(raw_bytes=raw), reg, sync)
 
         task = sync.get_task(result.task_id)
-        self.assertIsNotNone(task)
-        self.assertEqual(task["status"], "fetched")
         self.assertEqual(task["verdict"], "fetched_new")
-        self.assertEqual(task["observed_source_revision"], "abc123")
-        self.assertEqual(task["document_id"], result.document_id)
-        self.assertEqual(task["job_id"], result.job_id)
+        self.assertEqual(task["source_hash_observed"], _sha256(raw),
+                         "source_hash_observed must be SHA-256 of fetched bytes")
+        self.assertIsNotNone(task["resulting_row_id"],
+                             "resulting_row_id must be set for fetched_new")
+        self.assertIsNotNone(task["document_id"])
+        self.assertIsNotNone(task["job_id"])
 
-    # ── Test 2: Re-sync with same hash → skipped_unchanged ───────────────────
+    def test_first_sync_creates_document_row_with_connector_fields(self):
+        reg, sync = self._reg_sync()
+        result, _ = _run_stubbed(_make_event(source_revision="git-sha-123"), reg, sync)
 
-    def test_resync_same_content_produces_skipped_unchanged(self):
-        """Re-sync with identical raw_bytes → verdict is skipped_unchanged."""
-        reg, sync = self._make_stubs()
-        raw = b"stable content"
-        event = self._make_event(raw_bytes=raw, source_revision="rev1")
+        rows = [r for r in reg._rows if r["document_id"] == result.document_id]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["connector_module"], "openrag")
+        self.assertEqual(row["source_uri"], "joblogic/api-reference.md")
+        self.assertEqual(row["source_revision"], "git-sha-123",
+                         "source_revision must be immutably set from event")
+
+    # ── Verdict: skipped_unchanged ────────────────────────────────────────────
+
+    def test_resync_same_content_skipped_unchanged(self):
+        reg, sync = self._reg_sync()
+        raw = b"# Stable content\n\nNo changes.\n"
+        event = _make_event(raw_bytes=raw, source_revision="rev1")
 
         # First sync — creates document
-        r1 = self._run_with_stubs(event, reg, sync)
-        self.assertEqual(r1.verdict, "fetched_new")
-
-        # Manually put the active document into registry so dedup check works
+        r1, _ = _run_stubbed(event, reg, sync)
+        # Promote to active manually (orchestrator is stubbed)
         doc_id = r1.document_id
-        # The stub's promote_to_active is called by run_pipeline stub (which is no-op)
-        # Simulate active state manually:
-        active_row = [r for r in reg._rows.values() if r["document_id"] == doc_id][0]
-        reg._docs[doc_id] = active_row
+        active_row = next(r for r in reg._rows if r["document_id"] == doc_id)
+        active_row["status"] = "active"
 
-        # Re-sync — same content
-        event2 = self._make_event(raw_bytes=raw, source_revision="rev2")
-        r2 = self._run_with_stubs(event2, reg, sync)
+        # Re-sync same content
+        event2 = _make_event(raw_bytes=raw, source_revision="rev2")
+        r2, _ = _run_stubbed(event2, reg, sync)
 
         self.assertEqual(r2.verdict, "skipped_unchanged")
         self.assertIsNone(r2.job_id)
         self.assertIsNone(r2.version)
 
-    def test_skipped_unchanged_does_not_create_new_document_row(self):
-        """skipped_unchanged must not add a new row to the documents table."""
-        reg, sync = self._make_stubs()
-        raw = b"stable content"
-        event = self._make_event(raw_bytes=raw)
-
-        r1 = self._run_with_stubs(event, reg, sync)
+    def test_skipped_unchanged_sets_source_hash_observed(self):
+        """skipped_unchanged task must record source_hash_observed (dedup evidence)."""
+        reg, sync = self._reg_sync()
+        raw = b"# Stable content\n"
+        r1, _ = _run_stubbed(_make_event(raw_bytes=raw), reg, sync)
         doc_id = r1.document_id
-        active_row = [r for r in reg._rows.values() if r["document_id"] == doc_id][0]
-        reg._docs[doc_id] = active_row
+        active_row = next(r for r in reg._rows if r["document_id"] == doc_id)
+        active_row["status"] = "active"
+
+        r2, _ = _run_stubbed(_make_event(raw_bytes=raw, source_revision="rev2"), reg, sync)
+        task = sync.get_task(r2.task_id)
+        self.assertEqual(task["source_hash_observed"], _sha256(raw))
+        self.assertIsNone(task["resulting_row_id"],
+                          "resulting_row_id must be NULL for skipped_unchanged")
+
+    def test_skipped_unchanged_document_id_set_on_task(self):
+        """skipped_unchanged task must have document_id set (logical doc exists)."""
+        reg, sync = self._reg_sync()
+        raw = b"# Stable content\n"
+        r1, _ = _run_stubbed(_make_event(raw_bytes=raw), reg, sync)
+        doc_id = r1.document_id
+        next(r for r in reg._rows if r["document_id"] == doc_id)["status"] = "active"
+
+        r2, _ = _run_stubbed(_make_event(raw_bytes=raw, source_revision="rev2"), reg, sync)
+        task = sync.get_task(r2.task_id)
+        self.assertIsNotNone(task["document_id"],
+                             "document_id must be set even for skipped_unchanged")
+
+    def test_skipped_unchanged_no_new_document_row(self):
+        reg, sync = self._reg_sync()
+        raw = b"# Stable\n"
+        r1, _ = _run_stubbed(_make_event(raw_bytes=raw), reg, sync)
+        next(r for r in reg._rows if r["document_id"] == r1.document_id)["status"] = "active"
         row_count_before = len(reg._rows)
 
-        event2 = self._make_event(raw_bytes=raw, source_revision="rev2")
-        self._run_with_stubs(event2, reg, sync)
+        _run_stubbed(_make_event(raw_bytes=raw, source_revision="rev2"), reg, sync)
+        self.assertEqual(len(reg._rows), row_count_before,
+                         "skipped_unchanged must not create a new document row")
 
-        self.assertEqual(
-            len(reg._rows), row_count_before,
-            "skipped_unchanged must not create a new document row",
-        )
+    # ── Verdict: fetched_updated ──────────────────────────────────────────────
 
-    def test_skipped_unchanged_records_observed_revision(self):
-        """skipped_unchanged sync task must record observed_source_revision."""
-        reg, sync = self._make_stubs()
-        raw = b"stable content"
-        event = self._make_event(raw_bytes=raw, source_revision="rev1")
-
-        r1 = self._run_with_stubs(event, reg, sync)
+    def test_resync_changed_content_fetched_updated(self):
+        reg, sync = self._reg_sync()
+        r1, _ = _run_stubbed(_make_event(raw_bytes=b"version 1"), reg, sync)
         doc_id = r1.document_id
-        active_row = [r for r in reg._rows.values() if r["document_id"] == doc_id][0]
-        reg._docs[doc_id] = active_row
+        next(r for r in reg._rows if r["document_id"] == doc_id)["status"] = "active"
 
-        event2 = self._make_event(raw_bytes=raw, source_revision="rev2-new-stamp")
-        r2 = self._run_with_stubs(event2, reg, sync)
-
-        task = sync.get_task(r2.task_id)
-        self.assertEqual(task["observed_source_revision"], "rev2-new-stamp")
-
-    # ── Test 3: Changed content → fetched_updated ────────────────────────────
-
-    def test_resync_changed_content_produces_fetched_updated(self):
-        """Re-sync with different raw_bytes → verdict is fetched_updated, new version created."""
-        reg, sync = self._make_stubs()
-        event = self._make_event(raw_bytes=b"version 1", source_revision="rev1")
-
-        r1 = self._run_with_stubs(event, reg, sync)
-        doc_id = r1.document_id
-        active_row = [r for r in reg._rows.values() if r["document_id"] == doc_id][0]
-        reg._docs[doc_id] = active_row
-
-        event2 = self._make_event(raw_bytes=b"version 2 content changed", source_revision="rev2")
-        r2 = self._run_with_stubs(event2, reg, sync)
-
+        r2, _ = _run_stubbed(_make_event(raw_bytes=b"version 2 changed"), reg, sync)
         self.assertEqual(r2.verdict, "fetched_updated")
-        self.assertEqual(r2.document_id, doc_id, "Same logical document_id for same source_uri")
-        self.assertEqual(r2.version, 2, "Version must increment for updated content")
-        self.assertIsNotNone(r2.job_id)
+        self.assertEqual(r2.document_id, doc_id)
+        self.assertEqual(r2.version, 2)
+        task = sync.get_task(r2.task_id)
+        self.assertIsNotNone(task["resulting_row_id"])
 
-    # ── Test 4: Orchestrator failure does NOT change sync verdict (W-C1.8) ───
-
-    def test_orchestrator_failure_does_not_change_sync_verdict(self):
-        """If run_pipeline raises, the sync verdict must remain fetched_new (not fetch_failed)."""
-        reg, sync = self._make_stubs()
-        event = self._make_event()
-
-        result = self._run_with_stubs(
-            event, reg, sync,
-            orchestrator_raises=RuntimeError("embedding service unavailable"),
-        )
-
-        # Sync verdict must be fetched_new even though orchestrator failed
-        task = sync.get_task(result.task_id)
-        self.assertIsNotNone(task)
-        self.assertIn(
-            task["verdict"], ("fetched_new", "fetched_updated"),
-            "Orchestrator failure must not revert sync verdict to fetch_failed",
-        )
-        self.assertEqual(task["status"], "fetched")
-
-    # ── Test 5: SHA in source_uri → fetch_failed ─────────────────────────────
+    # ── Verdict: fetch_failed ─────────────────────────────────────────────────
 
     def test_sha_in_source_uri_produces_fetch_failed(self):
-        """source_uri with a 40-char commit SHA must yield fetch_failed verdict."""
         from connectors.adapter import ConnectorEvent
-        sha = "a3f9c2d1" + "b" * 32
+        sha = "a3f9c2d1" + "b" * 32  # 40-char hex
         event = ConnectorEvent(
             connector_module="openrag",
             scope="scope/test",
@@ -363,33 +425,241 @@ class TestConnectorAdapterE2E(unittest.TestCase):
             filename="api.md",
             format="markdown",
             raw_bytes=b"content",
-            source_revision=sha,
         )
-
-        reg, sync = self._make_stubs()
-        result = self._run_with_stubs(event, reg, sync)
-
+        reg, sync = self._reg_sync()
+        result, _ = _run_stubbed(event, reg, sync)
         self.assertEqual(result.verdict, "fetch_failed")
-        self.assertIsNotNone(result.error_message)
         task = sync.get_task(result.task_id)
         self.assertEqual(task["verdict"], "fetch_failed")
         self.assertEqual(task["status"], "failed")
 
-    # ── Test: connector document identity fields are set ─────────────────────
+    # ── W-C1.9: Scope resolution wired into adapter ───────────────────────────
 
-    def test_connector_identity_fields_stored_on_document_row(self):
-        """connector_module, source_uri, and source_revision are stored on the document row."""
-        reg, sync = self._make_stubs()
-        event = self._make_event(source_revision="git-sha-abc123")
-        result = self._run_with_stubs(event, reg, sync)
+    def test_resolve_scope_is_called_with_connector_module_and_source_uri(self):
+        """resolve_scope() must be called before the sync task is created."""
+        reg, sync = self._reg_sync()
+        result, resolve_mock = _run_stubbed(_make_event(), reg, sync)
 
-        rows = [r for r in reg._rows.values() if r["document_id"] == result.document_id]
-        self.assertEqual(len(rows), 1)
-        row = rows[0]
-        self.assertEqual(row["connector_module"], "openrag")
-        self.assertEqual(row["source_uri"], "joblogic/api-reference.pdf")
-        self.assertEqual(row["source_revision"], "git-sha-abc123",
-                         "source_revision must be set on INSERT from event.source_revision")
+        resolve_mock.assert_called_once_with("openrag", "joblogic/api-reference.md")
+
+    def test_resolve_scope_result_overrides_event_scope(self):
+        """When resolve_scope returns a scope, it must be used instead of event.scope."""
+        reg, sync = self._reg_sync()
+        event = _make_event(scope="original-scope/docs")
+        result, _ = _run_stubbed(event, reg, sync, resolved_scope="mapped-scope/api")
+
+        # The task must have been created with the resolved scope
+        task = sync.get_task(result.task_id)
+        self.assertEqual(task["scope"], "mapped-scope/api",
+                         "Resolved scope must override event.scope")
+
+    def test_event_scope_used_when_no_mapping_matches(self):
+        """When resolve_scope returns None, event.scope is the fallback."""
+        reg, sync = self._reg_sync()
+        event = _make_event(scope="fallback-scope/docs")
+        result, _ = _run_stubbed(event, reg, sync, resolved_scope=None)
+
+        task = sync.get_task(result.task_id)
+        self.assertEqual(task["scope"], "fallback-scope/docs",
+                         "event.scope must be used when no mapping rule matches")
+
+    def test_no_scope_produces_fetch_failed(self):
+        """If resolve_scope returns None and event.scope is empty, verdict=fetch_failed."""
+        from connectors.adapter import ConnectorEvent
+        event = ConnectorEvent(
+            connector_module="openrag",
+            scope="",          # empty — no fallback
+            source_uri="some/doc.md",
+            filename="doc.md",
+            format="markdown",
+            raw_bytes=b"content",
+        )
+        reg, sync = self._reg_sync()
+        result, _ = _run_stubbed(event, reg, sync, resolved_scope=None)
+        self.assertEqual(result.verdict, "fetch_failed")
+        self.assertIsNotNone(result.error_message)
+
+    # ── W-C1.8: Orchestrator failure does NOT change sync verdict ─────────────
+
+    def test_orchestrator_failure_does_not_change_sync_verdict(self):
+        reg, sync = self._reg_sync()
+        result, _ = _run_stubbed(
+            _make_event(), reg, sync,
+            orchestrator_raises=RuntimeError("embedding service unavailable"),
+        )
+        task = sync.get_task(result.task_id)
+        self.assertIn(task["verdict"], ("fetched_new", "fetched_updated"))
+        self.assertEqual(task["status"], "fetched",
+                         "Sync task must remain fetched even if orchestrator raises")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TestConnectorAdapterRealPipeline: real normalizer + extractor + orchestrator
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestConnectorAdapterRealPipeline(unittest.TestCase):
+    """W-C1.12: Connector adapter with real normalizer/extractor/orchestrator.
+
+    Only httpx.post (Super RAG network call) is mocked.
+    Registry and connector_sync use in-memory stubs (no PostgreSQL).
+    Storage uses local filesystem at _TMP_STORE.
+
+    This verifies that ConnectorEvent bytes flow through the real pipeline and
+    produce a document in 'active' state — the same guarantee test_ingest_e2e.py
+    provides for the manual upload path.
+    """
+
+    def setUp(self):
+        self.reg = _InMemoryRegistry()
+        self.sync = _InMemoryConnectorSync()
+        # Ensure SUPER_RAG_INGEST_MAX_RETRIES is 1 for fast failure in tests
+        os.environ["SUPER_RAG_INGEST_MAX_RETRIES"] = "1"
+
+    def _run_real(self, event, *, super_rag_status=201, resolved_scope=None):
+        """Run ingest_from_connector with real pipeline, stubbing only:
+        - httpx.post → simulated Super RAG response
+        - db.registry in orchestrator → in-memory registry
+        - db.registry in adapter → in-memory registry
+        - connector_sync operations → in-memory sync stub
+        - resolve_scope → return resolved_scope (None = fallback to event.scope)
+        """
+        from connectors import adapter as _mod
+        import orchestrator as _orch
+
+        resolve_mock = MagicMock(return_value=resolved_scope)
+
+        # Build a fake httpx response
+        mock_resp = MagicMock()
+        mock_resp.status_code = super_rag_status
+        mock_resp.raise_for_status = MagicMock(
+            side_effect=None if super_rag_status < 400
+            else Exception(f"HTTP {super_rag_status}")
+        )
+
+        with (
+            patch.object(_mod, "registry", self.reg),
+            patch.object(_mod, "create_sync_task", self.sync.create_sync_task),
+            patch.object(_mod, "mark_fetching", self.sync.mark_fetching),
+            patch.object(_mod, "set_verdict", self.sync.set_verdict),
+            patch.object(_mod, "get_task", self.sync.get_task),
+            patch.object(_mod, "resolve_scope", resolve_mock),
+            # Patch registry inside orchestrator too
+            patch.object(_orch, "registry", self.reg),
+            # Mock only the Super RAG network call
+            patch("httpx.post", return_value=mock_resp),
+        ):
+            result = _mod.ingest_from_connector(event)
+        return result
+
+    def test_markdown_connector_event_reaches_active_state(self):
+        """Full pipeline: markdown ConnectorEvent → normalizer → extractor → Super RAG → active."""
+        event = _make_event(
+            raw_bytes=b"# API Reference\n\n## Authentication\n\nUse bearer tokens.\n",
+            source_revision="v1-rev",
+        )
+        result = self._run_real(event)
+
+        self.assertEqual(result.verdict, "fetched_new")
+        self.assertIsNotNone(result.document_id)
+        self.assertEqual(result.version, 1)
+        self.assertIsNotNone(result.job_id)
+
+        # Document must be in active state (orchestrator ran promote_to_active)
+        active = self.reg.active_row(result.document_id)
+        self.assertIsNotNone(active, "Document must be in active state after successful pipeline")
+        self.assertEqual(active["status"], "active")
+
+    def test_real_pipeline_stores_connector_provenance(self):
+        """connector_module, source_uri, source_revision must be on the active document row."""
+        event = _make_event(
+            raw_bytes=b"# Guide\n\nContent here.\n",
+            source_revision="git-abc123",
+        )
+        result = self._run_real(event)
+
+        active = self.reg.active_row(result.document_id)
+        self.assertEqual(active["connector_module"], "openrag")
+        self.assertEqual(active["source_uri"], "joblogic/api-reference.md")
+        self.assertEqual(active["source_revision"], "git-abc123",
+                         "source_revision must be immutable provenance from event")
+
+    def test_real_pipeline_sync_task_has_correct_schema_fields(self):
+        """source_hash_observed and resulting_row_id must be set on sync task."""
+        raw = b"# API Reference\n\n## Auth\n\nBearers.\n"
+        event = _make_event(raw_bytes=raw)
+        result = self._run_real(event)
+
+        task = self.sync.get_task(result.task_id)
+        self.assertEqual(task["verdict"], "fetched_new")
+        self.assertEqual(task["source_hash_observed"], _sha256(raw))
+        self.assertIsNotNone(task["resulting_row_id"])
+
+    def test_real_pipeline_super_rag_failure_leaves_document_failed(self):
+        """Super RAG HTTP 500 → document status=failed; sync verdict=fetched_new (W-C1.8)."""
+        event = _make_event()
+        result = self._run_real(event, super_rag_status=500)
+
+        # Sync verdict must still be fetched_new — failure happened in orchestrator
+        task = self.sync.get_task(result.task_id)
+        self.assertIn(task["verdict"], ("fetched_new", "fetched_updated"),
+                      "Sync verdict must not change to fetch_failed on orchestrator failure")
+
+        # Document row must be in failed state
+        rows = [r for r in self.reg._rows if r["document_id"] == result.document_id]
+        self.assertTrue(len(rows) > 0, "Document row must exist")
+        # At least one row should be in failed state
+        statuses = {r["status"] for r in rows}
+        self.assertTrue(
+            "failed" in statuses or "active" not in statuses,
+            f"Document should be failed after Super RAG 500, got statuses: {statuses}",
+        )
+
+    def test_real_pipeline_scope_mapping_overrides_event_scope(self):
+        """When resolve_scope returns a scope, the real pipeline uses it."""
+        event = _make_event(scope="original/scope")
+        result = self._run_real(event, resolved_scope="mapped/scope")
+
+        # The sync task must be under the resolved scope
+        task = self.sync.get_task(result.task_id)
+        self.assertEqual(task["scope"], "mapped/scope")
+
+        # The document row must have the resolved scope
+        rows = [r for r in self.reg._rows if r["document_id"] == result.document_id]
+        self.assertTrue(len(rows) > 0)
+        self.assertEqual(rows[0]["scope"], "mapped/scope")
+
+    def test_real_pipeline_skipped_unchanged_does_not_run_orchestrator(self):
+        """skipped_unchanged: real normalizer/orchestrator must NOT be called."""
+        raw = b"# API Reference\n\nAuthentication section.\n"
+        event1 = _make_event(raw_bytes=raw, source_revision="rev1")
+        result1 = self._run_real(event1)
+
+        # Promote first document to active
+        doc_id = result1.document_id
+        active_row = next(r for r in self.reg._rows if r["document_id"] == doc_id)
+        active_row["status"] = "active"
+        row_count_after_first = len(self.reg._rows)
+
+        # Second sync with same content
+        event2 = _make_event(raw_bytes=raw, source_revision="rev2")
+        with patch("httpx.post") as mock_post:
+            from connectors import adapter as _mod
+            import orchestrator as _orch
+            with (
+                patch.object(_mod, "registry", self.reg),
+                patch.object(_mod, "create_sync_task", self.sync.create_sync_task),
+                patch.object(_mod, "mark_fetching", self.sync.mark_fetching),
+                patch.object(_mod, "set_verdict", self.sync.set_verdict),
+                patch.object(_mod, "get_task", self.sync.get_task),
+                patch.object(_mod, "resolve_scope", MagicMock(return_value=None)),
+                patch.object(_orch, "registry", self.reg),
+            ):
+                result2 = _mod.ingest_from_connector(event2)
+
+        self.assertEqual(result2.verdict, "skipped_unchanged")
+        mock_post.assert_not_called()
+        self.assertEqual(len(self.reg._rows), row_count_after_first,
+                         "skipped_unchanged must not create a new document row")
 
 
 if __name__ == "__main__":

@@ -47,27 +47,51 @@ logger = logging.getLogger(__name__)
 
 # ── Stable document_id derivation ────────────────────────────────────────────
 
-# Regex to detect a bare 40-character hex SHA in a URI (commit SHA, blob SHA, etc.)
-# Used to reject source_uri values that embed volatile revision selectors.
+# Patterns that indicate a volatile revision selector embedded in source_uri.
+# These make the URI unstable — two fetches at different revisions produce different
+# document_ids instead of a new version of the same document.
+#
+# What IS rejected:
+#   - Bare 40-character hex SHA anywhere in the path or query string
+#     (git commit SHA, git blob SHA, content-addressed storage keys)
+#     e.g. /blob/a3f9c2d.../file.md or ?ref=a3f9c2d...
+#
+# What is NOT rejected (by design):
+#   - Abbreviated SHAs < 40 chars (ambiguous with numeric IDs, product codes, etc.)
+#   - Non-hex revision IDs (Confluence page version numbers, JIRA IDs, etc.)
+#     These require connector-specific knowledge to distinguish from stable IDs.
+#   - Branch names containing hex chars (e.g. "feature/fix-f00d-bug")
+#     These are stable logical locators even if they contain hex substrings.
+#
+# If your connector uses a non-hex, non-40-char revision stamp as source_uri,
+# do NOT embed it in source_uri. Put it in source_revision instead.
 import re as _re
+
 _SHA40_RE = _re.compile(r'(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])', _re.IGNORECASE)
 
 
 def _validate_source_uri(source_uri: str) -> None:
-    """Raise ValueError if source_uri contains a volatile revision selector.
+    """Raise ValueError if source_uri contains a 40-character hex revision selector.
 
-    source_uri must be a stable logical locator. Embedding a 40-character hex
-    commit SHA or blob SHA (e.g. GitHub /blob/<sha>/ URLs, ?ref=<sha>) makes the
-    URI unstable — two versions of the same document would get different IDs.
+    source_uri must be the stable logical locator for the external source document.
+    A 40-character hex string (git commit SHA, git blob SHA, content-addressed key)
+    makes the URI volatile — two fetches at different revisions produce different
+    document_ids rather than incrementing the version of the same document.
 
-    Use source_revision to carry the exact external revision at ingest time.
+    Validation scope:
+      Rejects only bare 40-character hex SHAs (the definitive git SHA format).
+      Abbreviated SHAs (<40 chars) and non-hex revision IDs are not blocked here
+      because they cannot be reliably distinguished from stable path components
+      without connector-specific context.
+
+    Fix: store the volatile revision stamp in source_revision instead.
     """
     if _SHA40_RE.search(source_uri):
         raise ValueError(
             f"source_uri must not contain a 40-character hex revision selector "
-            f"(commit SHA / blob SHA detected). "
-            f"Use source_revision to record the exact external revision. "
-            f"Got: {source_uri!r}"
+            f"(commit SHA / blob SHA detected in: {source_uri!r}). "
+            f"source_uri must be the stable logical locator — use source_revision "
+            f"to record the exact external revision at ingest time."
         )
 
 

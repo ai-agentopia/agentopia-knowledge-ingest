@@ -73,22 +73,28 @@ def set_verdict(
     *,
     verdict: str,
     observed_source_revision: str | None = None,
+    source_hash_observed: str | None = None,
     document_id: str | None = None,
+    resulting_row_id: int | None = None,
     job_id: str | None = None,
     error_message: str | None = None,
 ) -> None:
     """Finalize a sync task with a verdict.
 
-    For fetched_new / fetched_updated: status → 'fetched'; document_id and
-    job_id are populated after the ingest handoff.
+    For fetched_new / fetched_updated:
+      status → 'fetched'; document_id, resulting_row_id, and job_id are populated.
 
-    For skipped_unchanged: status → 'fetched'; document_id and job_id are NULL
-    (no document row was written, no ingest job created).
+    For skipped_unchanged:
+      status → 'fetched'; document_id is set (the logical document that was checked).
+      resulting_row_id and job_id are NULL (no new document row written, no ingest job).
+      source_hash_observed records what hash was seen (dedup evidence).
 
-    For fetch_failed: status → 'failed'; document_id and job_id are NULL.
+    For fetch_failed:
+      status → 'failed'; document_id is NULL if source_uri validation failed;
+      resulting_row_id and job_id are NULL.
 
-    observed_source_revision is always recorded here (even for skipped_unchanged).
-    It is NEVER written to documents.source_revision.
+    observed_source_revision and source_hash_observed are recorded for all
+    verdicts that complete a fetch. They are NEVER written to documents.source_revision.
 
     Valid verdicts: fetched_new | fetched_updated | skipped_unchanged | fetch_failed
     """
@@ -105,7 +111,9 @@ def set_verdict(
                 status                   = %s,
                 verdict                  = %s,
                 observed_source_revision = COALESCE(%s, observed_source_revision),
+                source_hash_observed     = COALESCE(%s, source_hash_observed),
                 document_id              = COALESCE(%s, document_id),
+                resulting_row_id         = COALESCE(%s, resulting_row_id),
                 job_id                   = COALESCE(%s, job_id),
                 error_message            = COALESCE(%s, error_message),
                 updated_at               = NOW()
@@ -114,7 +122,9 @@ def set_verdict(
             (
                 final_status, verdict,
                 observed_source_revision,
+                source_hash_observed,
                 document_id,
+                resulting_row_id,
                 job_id,
                 error_message,
                 task_id,
@@ -122,20 +132,27 @@ def set_verdict(
         )
 
 
+_SELECT = """
+SELECT task_id, connector_module, scope, source_uri,
+       status, verdict, observed_source_revision, source_hash_observed,
+       document_id, resulting_row_id, job_id, error_message,
+       created_at, updated_at
+FROM connector_sync_tasks
+"""
+# Column index reference:
+#  0  task_id                   7  source_hash_observed
+#  1  connector_module          8  document_id
+#  2  scope                     9  resulting_row_id
+#  3  source_uri                10 job_id
+#  4  status                    11 error_message
+#  5  verdict                   12 created_at
+#  6  observed_source_revision  13 updated_at
+
+
 def get_task(task_id: str) -> dict | None:
     """Return a sync task by task_id, or None if not found."""
     with transaction() as cur:
-        cur.execute(
-            """
-            SELECT task_id, connector_module, scope, source_uri,
-                   status, verdict, observed_source_revision,
-                   document_id, job_id, error_message,
-                   created_at, updated_at
-            FROM connector_sync_tasks
-            WHERE task_id = %s
-            """,
-            (task_id,),
-        )
+        cur.execute(_SELECT + "WHERE task_id = %s", (task_id,))
         row = cur.fetchone()
         return _row_to_dict(row) if row else None
 
@@ -151,16 +168,7 @@ def get_latest_task(
     """
     with transaction() as cur:
         cur.execute(
-            """
-            SELECT task_id, connector_module, scope, source_uri,
-                   status, verdict, observed_source_revision,
-                   document_id, job_id, error_message,
-                   created_at, updated_at
-            FROM connector_sync_tasks
-            WHERE connector_module = %s AND source_uri = %s
-            ORDER BY created_at DESC
-            LIMIT 1
-            """,
+            _SELECT + "WHERE connector_module = %s AND source_uri = %s ORDER BY created_at DESC LIMIT 1",
             (connector_module, source_uri),
         )
         row = cur.fetchone()
@@ -178,30 +186,12 @@ def list_tasks(
     with transaction() as cur:
         if status is not None:
             cur.execute(
-                """
-                SELECT task_id, connector_module, scope, source_uri,
-                       status, verdict, observed_source_revision,
-                       document_id, job_id, error_message,
-                       created_at, updated_at
-                FROM connector_sync_tasks
-                WHERE connector_module = %s AND scope = %s AND status = %s
-                ORDER BY created_at DESC
-                LIMIT %s
-                """,
+                _SELECT + "WHERE connector_module = %s AND scope = %s AND status = %s ORDER BY created_at DESC LIMIT %s",
                 (connector_module, scope, status, limit),
             )
         else:
             cur.execute(
-                """
-                SELECT task_id, connector_module, scope, source_uri,
-                       status, verdict, observed_source_revision,
-                       document_id, job_id, error_message,
-                       created_at, updated_at
-                FROM connector_sync_tasks
-                WHERE connector_module = %s AND scope = %s
-                ORDER BY created_at DESC
-                LIMIT %s
-                """,
+                _SELECT + "WHERE connector_module = %s AND scope = %s ORDER BY created_at DESC LIMIT %s",
                 (connector_module, scope, limit),
             )
         return [_row_to_dict(r) for r in cur.fetchall()]
@@ -219,9 +209,11 @@ def _row_to_dict(row) -> dict:
         "status": row[4],
         "verdict": row[5],
         "observed_source_revision": row[6],
-        "document_id": str(row[7]) if row[7] else None,
-        "job_id": str(row[8]) if row[8] else None,
-        "error_message": row[9],
-        "created_at": _iso(row[10]),
-        "updated_at": _iso(row[11]),
+        "source_hash_observed": row[7],
+        "document_id": str(row[8]) if row[8] else None,
+        "resulting_row_id": row[9],
+        "job_id": str(row[10]) if row[10] else None,
+        "error_message": row[11],
+        "created_at": _iso(row[12]),
+        "updated_at": _iso(row[13]),
     }
