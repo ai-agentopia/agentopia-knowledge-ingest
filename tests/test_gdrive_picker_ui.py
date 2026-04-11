@@ -1,8 +1,17 @@
 """W-C3.4 Google Drive picker UI tests — knowledge-ingest#48.
 
-Validates the Google Drive Picker section added to the operator console at GET /ui.
-All checks operate on the rendered HTML/JS string: no browser execution, no real
-Google API calls. Pattern mirrors test_operator_ui.py.
+Two layers of validation:
+
+Layer 1 — HTML/JS string checks (classes TestGDriveSectionPresent through
+TestGDriveButtonWiring): validate structure, identity contract, and error-handling
+text in the rendered HTML. Fast, no external dependencies.
+
+Layer 2 — Node.js execution (class TestGDriveJSExecution): extracts the <script>
+block from /ui, prepends minimal DOM/Google-API stubs, and runs via Node.js
+subprocess. This exercises actual JS runtime behaviour — format inference, Sheets/
+Slides rejection logic, source_uri population in the picker callback, and
+_arrayBufferToBase64 encoding — none of which are string-matchable with confidence.
+Requires Node.js >= 16 (v22 available in this environment).
 
 Coverage:
   1. Google Drive section renders in /ui response.
@@ -12,18 +21,27 @@ Coverage:
   5. source_uri format 'gdrive://' present in JS.
   6. Submit path targets POST /connectors/ingest.
   7. raw_bytes_b64 present in payload construction.
-  8. Google Sheets and Google Slides rejection text present.
+  8. Google Sheets and Google Slides rejection text present (string) and executed (Node.js).
   9. 422 and 413 response handling present in JS.
  10. Verdict display (fetched_new, skipped_unchanged, fetch_failed) in JS.
  11. No new Python routes added to connector_routes.py or s3_routes.py.
  12. No new Python module imports added to routes.py beyond the allowed set.
  13. _GDRIVE_CFG injected by operator_ui() when env vars are set.
  14. Picker button id and ingest button id exist in DOM.
+ 15. [Node.js] _gdriveInferFormat returns correct format for PDF, DOCX, HTML, Google Docs.
+ 16. [Node.js] _gdriveInferFormat returns null for Sheets/Slides.
+ 17. [Node.js] _gdrivePickerCallback rejects Sheets — sets message, leaves _gdriveSelectedFile null.
+ 18. [Node.js] _gdrivePickerCallback populates source_uri, filename, format for PDF file.
+ 19. [Node.js] _arrayBufferToBase64 encodes known bytes to correct base64 string.
+ 20. [Node.js] _gdriveConfigured() returns true/false based on _GDRIVE_CFG values.
 """
 
 import contextlib
 import importlib
+import json
 import os
+import shutil
+import subprocess
 import sys
 import unittest
 from unittest.mock import patch
@@ -638,6 +656,330 @@ class TestGDriveButtonWiring(unittest.TestCase):
         html = _unconfigured_html()
         self.assertIn("function _gdrivePickerCallback(", html,
                       "_gdrivePickerCallback function missing from /ui JS")
+
+
+# ---------------------------------------------------------------------------
+# 15. Node.js executed JS tests (Layer 2 — genuine runtime validation)
+# ---------------------------------------------------------------------------
+
+_NODE_STUBS = """\
+// Minimal stubs so the script block runs in Node.js without a real browser.
+// These cover the IIFE (_initGDriveConfigState) and picker callback DOM refs.
+const _elements = {
+  gdriveOut:       { textContent: '', innerHTML: '', style: {} },
+  gdriveBtnIngest: { disabled: true,  style: { opacity: '0.5' } },
+  gdriveBtnPick:   { disabled: false, style: { opacity: '1'   }, title: '' },
+  gdriveConfigWarning: { style: { display: 'none' } },
+  gdriveFileName:  { value: '' },
+  gdriveSourceUri: { value: '' },
+  gdriveFormat:    { value: '' },
+};
+const document = {
+  getElementById: (id) => _elements[id] || { value: '', style: {}, disabled: false, textContent: '' },
+  createElement: (tag) => ({ src: '', onload: null, setAttribute: () => {} }),
+  head: { appendChild: (el) => { if (el.onload) el.onload(); } },
+  readyState: 'complete',
+  addEventListener: () => {},
+};
+const google = {
+  picker: {
+    Action: { PICKED: 'picked', CANCEL: 'cancel' },
+    DocsView: class {
+      setIncludeFolders() { return this; }
+      setSelectFolderEnabled() { return this; }
+    },
+    PickerBuilder: class {
+      addView()         { return this; } setOAuthToken()   { return this; }
+      setDeveloperKey() { return this; } setCallback()     { return this; }
+      setAppId()        { return this; } build()           { return { setVisible: () => {} }; }
+    },
+    ViewId: { DOCS: 'docs' },
+  },
+  accounts: { oauth2: { initTokenClient: () => ({ requestAccessToken: () => {} }) } },
+};
+// btoa is natively available in Node >= 16.
+"""
+
+
+class TestGDriveJSExecution(unittest.TestCase):
+    """Execute extracted JS functions in Node.js to validate runtime behaviour.
+
+    These tests exercise actual JavaScript execution — not string matching.
+    They cover:
+    - Format inference (_gdriveInferFormat)
+    - Unsupported MIME rejection (_GDRIVE_UNSUPPORTED_WORKSPACE)
+    - Picker callback: Sheets/Slides rejection path
+    - Picker callback: supported file → source_uri / filename / format population
+    - Base64 encoding (_arrayBufferToBase64)
+    - Config detection (_gdriveConfigured)
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._node = shutil.which('node')
+
+    def _skip_if_no_node(self):
+        if not self._node:
+            self.skipTest("Node.js not available on this machine")
+
+    def _extract_js(self) -> str:
+        """Return the <script> block content from the rendered /ui HTML."""
+        html = _configured_html()
+        start = html.find('<script>')
+        end = html.rfind('</script>')
+        self.assertGreater(start, -1, "<script> block not found in /ui")
+        return html[start + len('<script>'):end]
+
+    def _run_js(self, assertion_code: str) -> dict:
+        """Prepend stubs + UI script block, append assertion_code, run in Node.js."""
+        self._skip_if_no_node()
+        js_body = self._extract_js()
+        full_script = _NODE_STUBS + js_body + "\n" + assertion_code
+        result = subprocess.run(
+            [self._node, '-e', full_script],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            self.fail(
+                f"Node.js execution failed (exit {result.returncode}):\n"
+                f"STDERR: {result.stderr}\n"
+                f"STDOUT: {result.stdout}"
+            )
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError:
+            self.fail(f"Node.js output is not valid JSON:\n{result.stdout}")
+
+    # ── Format inference ────────────────────────────────────────────────────
+
+    def test_infer_format_pdf(self):
+        """_gdriveInferFormat('application/pdf') must return format='pdf', exportMime=null."""
+        out = self._run_js(
+            "const r = _gdriveInferFormat('application/pdf');\n"
+            "console.log(JSON.stringify({ format: r ? r.format : null, exportMime: r ? r.exportMime : 'MISSING' }));"
+        )
+        self.assertEqual(out['format'], 'pdf')
+        self.assertIsNone(out['exportMime'])
+
+    def test_infer_format_html(self):
+        """_gdriveInferFormat('text/html') must return format='html'."""
+        out = self._run_js(
+            "const r = _gdriveInferFormat('text/html');\n"
+            "console.log(JSON.stringify({ format: r ? r.format : null }));"
+        )
+        self.assertEqual(out['format'], 'html')
+
+    def test_infer_format_plain_text(self):
+        """_gdriveInferFormat('text/plain') must return format='txt'."""
+        out = self._run_js(
+            "const r = _gdriveInferFormat('text/plain');\n"
+            "console.log(JSON.stringify({ format: r ? r.format : null }));"
+        )
+        self.assertEqual(out['format'], 'txt')
+
+    def test_infer_format_google_docs_exports_docx(self):
+        """Google Docs MIME must map to format='docx' with a non-null exportMime."""
+        out = self._run_js(
+            "const r = _gdriveInferFormat('application/vnd.google-apps.document');\n"
+            "console.log(JSON.stringify({ format: r ? r.format : null, hasExportMime: r ? !!r.exportMime : false }));"
+        )
+        self.assertEqual(out['format'], 'docx')
+        self.assertTrue(out['hasExportMime'], "Google Docs must have a non-null exportMime (DOCX export endpoint)")
+
+    def test_infer_format_sheets_returns_null(self):
+        """_gdriveInferFormat must return null for Google Sheets (unsupported)."""
+        out = self._run_js(
+            "const r = _gdriveInferFormat('application/vnd.google-apps.spreadsheet');\n"
+            "console.log(JSON.stringify({ result: r }));"
+        )
+        self.assertIsNone(out['result'],
+                          "_gdriveInferFormat must return null for Google Sheets MIME")
+
+    def test_infer_format_slides_returns_null(self):
+        """_gdriveInferFormat must return null for Google Slides (unsupported)."""
+        out = self._run_js(
+            "const r = _gdriveInferFormat('application/vnd.google-apps.presentation');\n"
+            "console.log(JSON.stringify({ result: r }));"
+        )
+        self.assertIsNone(out['result'],
+                          "_gdriveInferFormat must return null for Google Slides MIME")
+
+    def test_infer_format_unknown_mime_returns_null(self):
+        """_gdriveInferFormat must return null for unknown MIME types."""
+        out = self._run_js(
+            "const r = _gdriveInferFormat('application/octet-stream');\n"
+            "console.log(JSON.stringify({ result: r }));"
+        )
+        self.assertIsNone(out['result'])
+
+    # ── Unsupported workspace membership ────────────────────────────────────
+
+    def test_unsupported_workspace_has_sheets(self):
+        """_GDRIVE_UNSUPPORTED_WORKSPACE.has() must return true for Sheets."""
+        out = self._run_js(
+            "console.log(JSON.stringify({"
+            " sheets: _GDRIVE_UNSUPPORTED_WORKSPACE.has('application/vnd.google-apps.spreadsheet')"
+            "}));"
+        )
+        self.assertTrue(out['sheets'])
+
+    def test_unsupported_workspace_has_slides(self):
+        """_GDRIVE_UNSUPPORTED_WORKSPACE.has() must return true for Slides."""
+        out = self._run_js(
+            "console.log(JSON.stringify({"
+            " slides: _GDRIVE_UNSUPPORTED_WORKSPACE.has('application/vnd.google-apps.presentation')"
+            "}));"
+        )
+        self.assertTrue(out['slides'])
+
+    def test_unsupported_workspace_excludes_pdf(self):
+        """_GDRIVE_UNSUPPORTED_WORKSPACE.has() must return false for PDF."""
+        out = self._run_js(
+            "console.log(JSON.stringify({"
+            " pdf: _GDRIVE_UNSUPPORTED_WORKSPACE.has('application/pdf')"
+            "}));"
+        )
+        self.assertFalse(out['pdf'])
+
+    # ── Picker callback: Sheets rejection ───────────────────────────────────
+
+    def test_picker_callback_rejects_sheets(self):
+        """_gdrivePickerCallback with Sheets MIME must set error message and leave _gdriveSelectedFile null."""
+        out = self._run_js(
+            "_gdrivePickerCallback({"
+            "  action: 'picked',"
+            "  docs: [{ id: 'SHEET1', name: 'budget.xlsx', mimeType: 'application/vnd.google-apps.spreadsheet' }]"
+            "});\n"
+            "console.log(JSON.stringify({"
+            "  selectedFile: _gdriveSelectedFile,"
+            "  btnDisabled: _elements['gdriveBtnIngest'].disabled,"
+            "  msgContainsSheets: _elements['gdriveOut'].textContent.includes('Google Sheets')"
+            "}));"
+        )
+        self.assertIsNone(out['selectedFile'],
+                          "_gdriveSelectedFile must remain null after Sheets rejection")
+        self.assertTrue(out['btnDisabled'],
+                        "Ingest button must remain disabled after Sheets rejection")
+        self.assertTrue(out['msgContainsSheets'],
+                        "Rejection message must mention 'Google Sheets'")
+
+    def test_picker_callback_rejects_slides(self):
+        """_gdrivePickerCallback with Slides MIME must set error message and leave _gdriveSelectedFile null."""
+        out = self._run_js(
+            "_gdrivePickerCallback({"
+            "  action: 'picked',"
+            "  docs: [{ id: 'SLIDE1', name: 'deck.pptx', mimeType: 'application/vnd.google-apps.presentation' }]"
+            "});\n"
+            "console.log(JSON.stringify({"
+            "  selectedFile: _gdriveSelectedFile,"
+            "  msgContainsSlides: _elements['gdriveOut'].textContent.includes('Google Slides')"
+            "}));"
+        )
+        self.assertIsNone(out['selectedFile'],
+                          "_gdriveSelectedFile must remain null after Slides rejection")
+        self.assertTrue(out['msgContainsSlides'],
+                        "Rejection message must mention 'Google Slides'")
+
+    # ── Picker callback: supported file → field population ──────────────────
+
+    def test_picker_callback_populates_source_uri_for_pdf(self):
+        """_gdrivePickerCallback with PDF must set gdriveSourceUri to gdrive://{fileId}."""
+        out = self._run_js(
+            "_gdrivePickerCallback({"
+            "  action: 'picked',"
+            "  docs: [{ id: 'FILE123', name: 'report.pdf', mimeType: 'application/pdf' }]"
+            "});\n"
+            "console.log(JSON.stringify({"
+            "  sourceUri: _elements['gdriveSourceUri'].value,"
+            "  fileName:  _elements['gdriveFileName'].value,"
+            "  format:    _elements['gdriveFormat'].value,"
+            "  btnEnabled: !_elements['gdriveBtnIngest'].disabled,"
+            "  selectedFileId: _gdriveSelectedFile ? _gdriveSelectedFile.id : null"
+            "}));"
+        )
+        self.assertEqual(out['sourceUri'], 'gdrive://FILE123',
+                         "source_uri must be 'gdrive://{fileId}'")
+        self.assertEqual(out['fileName'], 'report.pdf')
+        self.assertEqual(out['format'], 'pdf')
+        self.assertTrue(out['btnEnabled'],
+                        "Ingest button must be enabled after valid file selection")
+        self.assertEqual(out['selectedFileId'], 'FILE123')
+
+    def test_picker_callback_populates_source_uri_for_google_docs(self):
+        """_gdrivePickerCallback with Google Docs MIME must set format=docx and gdrive:// URI."""
+        out = self._run_js(
+            "_gdrivePickerCallback({"
+            "  action: 'picked',"
+            "  docs: [{ id: 'DOC456', name: 'spec.gdoc', mimeType: 'application/vnd.google-apps.document' }]"
+            "});\n"
+            "console.log(JSON.stringify({"
+            "  sourceUri: _elements['gdriveSourceUri'].value,"
+            "  format: _elements['gdriveFormat'].value,"
+            "  exportMime: _gdriveSelectedFile ? _gdriveSelectedFile.exportMime : null"
+            "}));"
+        )
+        self.assertEqual(out['sourceUri'], 'gdrive://DOC456')
+        self.assertEqual(out['format'], 'docx')
+        self.assertIsNotNone(out['exportMime'],
+                             "Google Docs selection must set exportMime for DOCX export path")
+
+    def test_picker_callback_cancel_does_not_change_state(self):
+        """_gdrivePickerCallback with action=cancel must not modify _gdriveSelectedFile."""
+        out = self._run_js(
+            "_gdrivePickerCallback({ action: 'cancel', docs: [] });\n"
+            "console.log(JSON.stringify({ selectedFile: _gdriveSelectedFile }));"
+        )
+        self.assertIsNone(out['selectedFile'],
+                          "Cancel action must not populate _gdriveSelectedFile")
+
+    # ── Base64 encoding ─────────────────────────────────────────────────────
+
+    def test_array_buffer_to_base64_known_bytes(self):
+        """_arrayBufferToBase64 must encode known bytes to the correct base64 string."""
+        # "Hello" → SGVsbG8=
+        out = self._run_js(
+            "const buf = new Uint8Array([72,101,108,108,111]).buffer;\n"
+            "console.log(JSON.stringify({ b64: _arrayBufferToBase64(buf) }));"
+        )
+        self.assertEqual(out['b64'], 'SGVsbG8=',
+                         "_arrayBufferToBase64 must produce correct base64 for [72,101,108,108,111] ('Hello')")
+
+    def test_array_buffer_to_base64_empty(self):
+        """_arrayBufferToBase64 of empty buffer must return empty string."""
+        out = self._run_js(
+            "const buf = new ArrayBuffer(0);\n"
+            "console.log(JSON.stringify({ b64: _arrayBufferToBase64(buf) }));"
+        )
+        self.assertEqual(out['b64'], '')
+
+    # ── Config detection ────────────────────────────────────────────────────
+
+    def test_gdrive_configured_true_when_keys_set(self):
+        """_gdriveConfigured() must return true when _GDRIVE_CFG has apiKey and clientId."""
+        # _configured_html() injects real-looking values
+        out = self._run_js(
+            "console.log(JSON.stringify({ configured: _gdriveConfigured() }));"
+        )
+        self.assertTrue(out['configured'],
+                        "_gdriveConfigured() must return true when env vars are set")
+
+    def test_gdrive_configured_false_when_keys_empty(self):
+        """_gdriveConfigured() must return false when _GDRIVE_CFG.apiKey is empty."""
+        # Use unconfigured HTML which injects apiKey:""
+        html = _unconfigured_html()
+        start = html.find('<script>')
+        end = html.rfind('</script>')
+        js_body = html[start + len('<script>'):end]
+        full_script = _NODE_STUBS + js_body + "\nconsole.log(JSON.stringify({ configured: _gdriveConfigured() }));"
+        result = subprocess.run(
+            [self._node, '-e', full_script],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            self.fail(f"Node.js execution failed:\n{result.stderr}")
+        out = json.loads(result.stdout)
+        self.assertFalse(out['configured'],
+                         "_gdriveConfigured() must return false when GOOGLE_PICKER_API_KEY is empty")
 
 
 if __name__ == "__main__":

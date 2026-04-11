@@ -846,7 +846,7 @@ is downloaded for these types.
 |---|---|
 | `connector_module` | `"google_drive"` |
 | `source_uri` | `gdrive://{fileId}` — stable across renames |
-| `source_revision` | Not submitted via browser path — `modifiedTime` is Drive API metadata, not available in the picker response. The server assigns `source_revision` on ingest via the adapter. |
+| `source_revision` | Not submitted via the browser picker path. The Google Picker API response does not include `modifiedTime`. The browser does not send `source_revision` in the `POST /connectors/ingest` payload. The adapter stores it as `NULL` — no auto-assignment occurs. If `modifiedTime` provenance is required, it must be fetched separately from the Drive Files API and submitted explicitly by the caller. |
 
 ### Difference from W-C2.2 (server-side sync wrapper)
 
