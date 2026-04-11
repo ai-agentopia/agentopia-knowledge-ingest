@@ -323,7 +323,79 @@ as the last rule to ensure every document lands somewhere.
 
 ---
 
-## 11. Common Operations Quick Reference
+## 11. Trigger Ingestion via HTTP (W-C3.1)
+
+`POST /connectors/ingest` is the HTTP transport entry point for out-of-process connectors
+or any caller that cannot use the in-process `ingest_from_connector()` adapter directly.
+
+**All W-C1 invariants are enforced by the adapter — this endpoint adds no business logic.**
+
+### Request
+
+```bash
+curl -X POST http://localhost:8003/connectors/ingest \
+  -H "Content-Type: application/json" \
+  -d '{
+    "connector_module": "aws_s3",
+    "scope": "joblogic-kb/docs",
+    "source_uri": "s3://my-bucket/docs/api-reference.pdf",
+    "filename": "api-reference.pdf",
+    "format": "pdf",
+    "raw_bytes_b64": "<base64-encoded file content>",
+    "source_revision": "2026-01-15T10:30:00+00:00",
+    "owner": "operator@example.com",
+    "metadata": {"s3_bucket": "my-bucket", "s3_key": "docs/api-reference.pdf"}
+  }'
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `connector_module` | yes | Connector identifier (e.g. `"aws_s3"`, `"confluence"`) |
+| `scope` | yes | Target knowledge scope (must be registered via `POST /scopes`) |
+| `source_uri` | yes | Stable logical locator for the source document |
+| `filename` | yes | Display filename (e.g. `"api-reference.pdf"`) |
+| `format` | yes | One of: `pdf`, `docx`, `html`, `markdown`, `txt` |
+| `raw_bytes_b64` | yes | Base64-encoded (RFC 4648) raw document bytes |
+| `source_revision` | no | Revision stamp for provenance (e.g. ETag, LastModified) |
+| `owner` | no | Actor identifier for audit log |
+| `metadata` | no | Extra key/value pairs passed through to document metadata |
+
+### Response
+
+HTTP 200 for all adapter verdicts (including `fetch_failed`):
+
+```json
+{
+  "task_id": "...",
+  "verdict": "fetched_new",
+  "document_id": "...",
+  "job_id": "...",
+  "version": 1,
+  "error_message": null
+}
+```
+
+| `verdict` | Meaning |
+|---|---|
+| `fetched_new` | Document created for the first time |
+| `fetched_updated` | New version created (content changed) |
+| `skipped_unchanged` | SHA-256 matches active version — no write |
+| `fetch_failed` | Scope not registered or adapter-level error |
+
+### Error responses
+
+| Status | Cause |
+|---|---|
+| 422 | Malformed body, missing required field, invalid format, or invalid base64 |
+| 413 | Decoded payload exceeds 50 MiB |
+
+### Auth
+
+No bearer token required — same internal-network-only boundary as the operator UI.
+
+---
+
+## 12. Common Operations Quick Reference
 
 | Task | Command |
 |---|---|
@@ -340,6 +412,99 @@ as the last rule to ensure every document lands somewhere.
 | Debug retrieval | `GET /knowledge/debug/query?scope=...&q=...` (Super RAG) |
 | Configure scope mapping (env) | `CONNECTOR_SCOPE_MAPPINGS='[...]'` |
 | Configure scope mapping (file) | `CONNECTOR_SCOPE_MAPPINGS_FILE=/path/to/rules.json` |
+| HTTP connector ingest | `POST /connectors/ingest` |
+
+---
+
+## 12. Configure and Run the AWS S3 Connector (W-C2.1)
+
+The AWS S3 connector pulls documents from S3-compatible object storage into a
+knowledge scope. It uses the `ingest_from_connector()` adapter (W-C1) — all scope
+validation, dedup, versioning, and provenance rules apply unchanged.
+
+**Source:** `langflow-ai/openrag` `src/connectors/aws_s3/connector.py` (adapted).
+**Implementation:** `src/connectors/openrag_s3.py`, `src/connectors/aws_s3_wrapper.py`.
+**Issue:** knowledge-ingest#37.
+
+### Prerequisites
+
+1. Create the target scope (if not already done):
+   ```bash
+   curl -X POST http://localhost:8003/scopes \
+     -H "Content-Type: application/json" \
+     -d '{"scope_name": "joblogic-kb/s3-docs", "description": "S3 documents", "owner": "operator@example.com"}'
+   ```
+
+2. Configure scope mapping for the S3 connector:
+   ```bash
+   export CONNECTOR_SCOPE_MAPPINGS='[
+     {"connector_module": "aws_s3", "source_pattern": "s3://my-bucket/*", "scope": "joblogic-kb/s3-docs"}
+   ]'
+   ```
+
+### Secret handling requirements
+
+Credentials must come from managed secret storage — **never hardcode them**.
+
+Minimum required secret fields:
+
+| Field | Description |
+|---|---|
+| `access_key` | AWS Access Key ID (IAM user with `s3:GetObject`, `s3:ListBucket`) |
+| `secret_key` | AWS Secret Access Key |
+| `endpoint_url` | Optional; set for MinIO / Cloudflare R2 / custom S3-compatible endpoints |
+| `region` | Optional; default is `us-east-1` |
+| `bucket_names` | List of buckets to ingest from; empty list = auto-discover all accessible buckets |
+| `prefix` | Optional key prefix filter (e.g. `"docs/"`) |
+
+**K8s Secret example:**
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: s3-connector-creds
+type: Opaque
+stringData:
+  access_key: "<AWS_ACCESS_KEY_ID>"
+  secret_key: "<AWS_SECRET_ACCESS_KEY>"
+  bucket_names: '["my-docs-bucket"]'
+```
+
+### Running a sync
+
+```python
+import asyncio
+from connectors.aws_s3_wrapper import sync_s3_bucket
+
+config = {
+    "access_key": "<from secret store>",
+    "secret_key": "<from secret store>",
+    "bucket_names": ["my-docs-bucket"],
+    "prefix": "docs/",
+    "scope": "joblogic-kb/s3-docs",   # fallback if CONNECTOR_SCOPE_MAPPINGS not set
+    "owner": "operator@example.com",
+}
+
+results = asyncio.run(sync_s3_bucket(config))
+for r in results:
+    print(r.verdict, r.source_uri if hasattr(r, "source_uri") else "")
+```
+
+### Identity contract
+
+| Field | Value |
+|---|---|
+| `connector_module` | `"aws_s3"` |
+| `source_uri` | `s3://{bucket}/{key}` |
+| `source_revision` | `LastModified` ISO 8601 UTC string from boto3 |
+| Rename behaviour | Object rename = new `document_id` (new document, v1). Same semantics as manual upload rename. |
+| Unchanged detection | SHA-256 of raw bytes. Same object re-fetched with identical content → `skipped_unchanged`. |
+
+### Webhook support
+
+Not implemented in W-C2.1. The connector uses pull-based sync only. Run
+`sync_s3_bucket()` on a schedule or trigger it manually. S3 event notification
+integration is a future issue.
 
 ---
 
