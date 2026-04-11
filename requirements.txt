@@ -1,0 +1,24 @@
+fastapi>=0.115.0
+uvicorn[standard]==0.32.0
+pydantic>=2.11.3
+python-multipart==0.0.22
+httpx>=0.27.0
+
+# Database
+psycopg[binary]>=3.1.0
+
+# Storage
+boto3>=1.34.0
+
+# Normalizers
+pdfplumber>=0.11.0
+python-docx>=1.1.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+
+# Metadata extraction (optional YAML frontmatter support)
+pyyaml>=6.0.0
+
+# Testing
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
