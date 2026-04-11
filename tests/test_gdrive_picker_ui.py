@@ -1,0 +1,644 @@
+"""W-C3.4 Google Drive picker UI tests — knowledge-ingest#48.
+
+Validates the Google Drive Picker section added to the operator console at GET /ui.
+All checks operate on the rendered HTML/JS string: no browser execution, no real
+Google API calls. Pattern mirrors test_operator_ui.py.
+
+Coverage:
+  1. Google Drive section renders in /ui response.
+  2. Config warning shown + picker button disabled when env vars not set.
+  3. Config warning absent + picker button enabled when env vars are set.
+  4. connector_module is exactly 'google_drive' in JS payload.
+  5. source_uri format 'gdrive://' present in JS.
+  6. Submit path targets POST /connectors/ingest.
+  7. raw_bytes_b64 present in payload construction.
+  8. Google Sheets and Google Slides rejection text present.
+  9. 422 and 413 response handling present in JS.
+ 10. Verdict display (fetched_new, skipped_unchanged, fetch_failed) in JS.
+ 11. No new Python routes added to connector_routes.py or s3_routes.py.
+ 12. No new Python module imports added to routes.py beyond the allowed set.
+ 13. _GDRIVE_CFG injected by operator_ui() when env vars are set.
+ 14. Picker button id and ingest button id exist in DOM.
+"""
+
+import contextlib
+import importlib
+import os
+import sys
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+from fastapi.testclient import TestClient
+import main  # noqa  — registers all routers
+from main import app
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _get_ui_html(env_overrides: dict | None = None) -> str:
+    """GET /ui with optional env-var overrides injected via config mock."""
+    env_overrides = env_overrides or {}
+
+    with patch.dict(os.environ, env_overrides, clear=False):
+        # Force config to re-read env by bypassing lru_cache
+        import config as cfg_module
+        cfg_module.get_settings.cache_clear()
+        try:
+            client = TestClient(app, raise_server_exceptions=False)
+            resp = client.get("/ui")
+            assert resp.status_code == 200, f"/ui returned {resp.status_code}"
+            return resp.text
+        finally:
+            cfg_module.get_settings.cache_clear()
+
+
+def _unconfigured_html() -> str:
+    """Render /ui without picker env vars (simulates unconfigured state)."""
+    env = {
+        "GOOGLE_PICKER_API_KEY": "",
+        "GOOGLE_PICKER_CLIENT_ID": "",
+        "GOOGLE_PICKER_APP_ID": "",
+    }
+    return _get_ui_html(env)
+
+
+def _configured_html() -> str:
+    """Render /ui with picker env vars set (simulates configured state)."""
+    env = {
+        "GOOGLE_PICKER_API_KEY": "test-api-key-abc",
+        "GOOGLE_PICKER_CLIENT_ID": "test-client-id-xyz.apps.googleusercontent.com",
+        "GOOGLE_PICKER_APP_ID": "123456789",
+    }
+    return _get_ui_html(env)
+
+
+# ---------------------------------------------------------------------------
+# 1. Section presence
+# ---------------------------------------------------------------------------
+
+class TestGDriveSectionPresent(unittest.TestCase):
+    """The Google Drive section must exist in the rendered /ui page."""
+
+    def test_gdrive_section_heading_exists(self):
+        """hGDrive heading element must exist in the DOM."""
+        html = _unconfigured_html()
+        self.assertIn('id="hGDrive"', html,
+                      "Google Drive section heading (hGDrive) not found in /ui")
+
+    def test_gdrive_section_body_exists(self):
+        """sGDrive section body must exist in the DOM."""
+        html = _unconfigured_html()
+        self.assertIn('id="sGDrive"', html,
+                      "Google Drive section body (sGDrive) not found in /ui")
+
+    def test_gdrive_section_heading_text(self):
+        """Section heading must identify as Google Drive Ingest."""
+        html = _unconfigured_html()
+        self.assertIn("Google Drive Ingest", html,
+                      "Section heading must contain 'Google Drive Ingest'")
+
+    def test_gdrive_source_uri_field_exists(self):
+        """gdriveSourceUri input must exist so source_uri is visible."""
+        html = _unconfigured_html()
+        self.assertIn('id="gdriveSourceUri"', html,
+                      "gdriveSourceUri input missing from /ui")
+
+    def test_gdrive_filename_field_exists(self):
+        """gdriveFileName input must exist for selected file display."""
+        html = _unconfigured_html()
+        self.assertIn('id="gdriveFileName"', html,
+                      "gdriveFileName input missing from /ui")
+
+    def test_gdrive_format_field_exists(self):
+        """gdriveFormat input must exist for inferred format display."""
+        html = _unconfigured_html()
+        self.assertIn('id="gdriveFormat"', html,
+                      "gdriveFormat input missing from /ui")
+
+    def test_gdrive_scope_field_exists(self):
+        """gdriveScope input must exist for scope entry."""
+        html = _unconfigured_html()
+        self.assertIn('id="gdriveScope"', html,
+                      "gdriveScope input missing from /ui")
+
+    def test_gdrive_output_element_exists(self):
+        """gdriveOut output element must exist for status/result display."""
+        html = _unconfigured_html()
+        self.assertIn('id="gdriveOut"', html,
+                      "gdriveOut element missing from /ui")
+
+
+# ---------------------------------------------------------------------------
+# 2. Unconfigured state — warning shown, button disabled
+# ---------------------------------------------------------------------------
+
+class TestGDriveUnconfiguredState(unittest.TestCase):
+    """When picker env vars are absent, the UI must show a config warning."""
+
+    def test_config_warning_element_exists(self):
+        """gdriveConfigWarning element must exist in DOM."""
+        html = _unconfigured_html()
+        self.assertIn('id="gdriveConfigWarning"', html,
+                      "gdriveConfigWarning element missing from /ui")
+
+    def test_config_warning_mentions_env_vars(self):
+        """Warning text must name the required env vars."""
+        html = _unconfigured_html()
+        self.assertIn("GOOGLE_PICKER_API_KEY", html,
+                      "Config warning must name GOOGLE_PICKER_API_KEY")
+        self.assertIn("GOOGLE_PICKER_CLIENT_ID", html,
+                      "Config warning must name GOOGLE_PICKER_CLIENT_ID")
+
+    def test_pick_button_exists(self):
+        """gdriveBtnPick button must exist in DOM."""
+        html = _unconfigured_html()
+        self.assertIn('id="gdriveBtnPick"', html,
+                      "gdriveBtnPick button missing from /ui")
+
+    def test_ingest_button_starts_disabled(self):
+        """gdriveBtnIngest must start disabled before a file is selected."""
+        html = _unconfigured_html()
+        self.assertIn('id="gdriveBtnIngest"', html,
+                      "gdriveBtnIngest button missing from /ui")
+        # The button must have disabled attribute or disabled in HTML
+        idx = html.find('id="gdriveBtnIngest"')
+        surroundings = html[max(0, idx - 50):idx + 200]
+        self.assertIn("disabled", surroundings,
+                      "gdriveBtnIngest must be disabled by default")
+
+    def test_gdrive_cfg_empty_when_unconfigured(self):
+        """_GDRIVE_CFG must inject empty strings when env vars unset."""
+        html = _unconfigured_html()
+        # The injected config should contain empty apiKey
+        self.assertIn('const _GDRIVE_CFG = {', html,
+                      "_GDRIVE_CFG injection missing from /ui script block")
+        self.assertIn('apiKey:""', html,
+                      "apiKey must be empty string when GOOGLE_PICKER_API_KEY is unset")
+        self.assertIn('clientId:""', html,
+                      "clientId must be empty string when GOOGLE_PICKER_CLIENT_ID is unset")
+
+    def test_init_gdrive_config_state_iife_present(self):
+        """_initGDriveConfigState IIFE must be present to disable button on load."""
+        html = _unconfigured_html()
+        self.assertIn("_initGDriveConfigState", html,
+                      "_initGDriveConfigState IIFE missing — button won't disable when unconfigured")
+
+    def test_gdrive_configured_check_function_present(self):
+        """_gdriveConfigured() function must exist."""
+        html = _unconfigured_html()
+        self.assertIn("function _gdriveConfigured", html,
+                      "_gdriveConfigured function missing from /ui JS")
+
+
+# ---------------------------------------------------------------------------
+# 3. Configured state — env vars injected correctly
+# ---------------------------------------------------------------------------
+
+class TestGDriveConfiguredState(unittest.TestCase):
+    """When picker env vars are set, the injected JS config must carry their values."""
+
+    def test_api_key_injected(self):
+        """apiKey in _GDRIVE_CFG must match GOOGLE_PICKER_API_KEY env var."""
+        html = _configured_html()
+        self.assertIn('"test-api-key-abc"', html,
+                      "GOOGLE_PICKER_API_KEY value not injected into _GDRIVE_CFG.apiKey")
+
+    def test_client_id_injected(self):
+        """clientId in _GDRIVE_CFG must match GOOGLE_PICKER_CLIENT_ID env var."""
+        html = _configured_html()
+        self.assertIn('"test-client-id-xyz.apps.googleusercontent.com"', html,
+                      "GOOGLE_PICKER_CLIENT_ID value not injected into _GDRIVE_CFG.clientId")
+
+    def test_app_id_injected(self):
+        """appId in _GDRIVE_CFG must match GOOGLE_PICKER_APP_ID env var."""
+        html = _configured_html()
+        self.assertIn('"123456789"', html,
+                      "GOOGLE_PICKER_APP_ID value not injected into _GDRIVE_CFG.appId")
+
+    def test_gdrive_cfg_structure_well_formed(self):
+        """_GDRIVE_CFG must be a JS object with apiKey, clientId, appId keys."""
+        html = _configured_html()
+        cfg_start = html.find("const _GDRIVE_CFG = {")
+        self.assertGreater(cfg_start, -1, "_GDRIVE_CFG declaration not found")
+        cfg_region = html[cfg_start:cfg_start + 300]
+        self.assertIn("apiKey:", cfg_region)
+        self.assertIn("clientId:", cfg_region)
+        self.assertIn("appId:", cfg_region)
+
+
+# ---------------------------------------------------------------------------
+# 4–6. Identity contract: connector_module, source_uri, submit path
+# ---------------------------------------------------------------------------
+
+class TestGDriveIdentityContract(unittest.TestCase):
+    """JS must implement the identity contract from knowledge-ingest#38/#48."""
+
+    def test_connector_module_is_google_drive(self):
+        """connector_module must be exactly 'google_drive' in the payload JS."""
+        html = _unconfigured_html()
+        # Look in the doGDriveIngest function body
+        start = html.find("async function doGDriveIngest")
+        self.assertGreater(start, -1, "doGDriveIngest function not found")
+        fn_body = html[start:start + 2000]
+        self.assertIn("connector_module: 'google_drive'", fn_body,
+                      "connector_module must be 'google_drive' in doGDriveIngest payload")
+
+    def test_source_uri_gdrive_scheme(self):
+        """source_uri must use gdrive:// scheme in payload and UI."""
+        html = _unconfigured_html()
+        self.assertIn("gdrive://", html,
+                      "gdrive:// URI scheme must appear in /ui (identity contract)")
+
+    def test_source_uri_built_from_file_id_in_payload(self):
+        """source_uri in payload must be constructed as 'gdrive://' + fileId."""
+        html = _unconfigured_html()
+        start = html.find("async function doGDriveIngest")
+        fn_body = html[start:start + 2000]
+        self.assertIn("'gdrive://' + fileId", fn_body,
+                      "source_uri must be built as 'gdrive://' + fileId in doGDriveIngest")
+
+    def test_source_uri_in_picker_callback(self):
+        """_gdrivePickerCallback must set gdriveSourceUri to gdrive:// + fileId."""
+        html = _unconfigured_html()
+        start = html.find("function _gdrivePickerCallback")
+        self.assertGreater(start, -1, "_gdrivePickerCallback not found")
+        fn_body = html[start:start + 1500]
+        self.assertIn("gdrive://", fn_body,
+                      "Picker callback must write gdrive:// URI to gdriveSourceUri field")
+
+    def test_submit_path_is_connectors_ingest(self):
+        """doGDriveIngest must POST to '/connectors/ingest'."""
+        html = _unconfigured_html()
+        start = html.find("async function doGDriveIngest")
+        fn_body = html[start:start + 2000]
+        self.assertIn("'/connectors/ingest'", fn_body,
+                      "Submit path must be '/connectors/ingest' (W-C3.1 endpoint)")
+
+    def test_method_is_post(self):
+        """doGDriveIngest must use HTTP POST."""
+        html = _unconfigured_html()
+        start = html.find("async function doGDriveIngest")
+        fn_body = html[start:start + 2000]
+        self.assertIn("method: 'POST'", fn_body,
+                      "doGDriveIngest must use POST method")
+
+
+# ---------------------------------------------------------------------------
+# 7. raw_bytes_b64 payload field
+# ---------------------------------------------------------------------------
+
+class TestGDrivePayloadFields(unittest.TestCase):
+    """The payload submitted to /connectors/ingest must include raw_bytes_b64."""
+
+    def test_raw_bytes_b64_in_payload(self):
+        """raw_bytes_b64 must be a field in the doGDriveIngest payload object."""
+        html = _unconfigured_html()
+        start = html.find("async function doGDriveIngest")
+        fn_body = html[start:start + 2000]
+        self.assertIn("raw_bytes_b64", fn_body,
+                      "raw_bytes_b64 must be in the payload sent to /connectors/ingest")
+
+    def test_array_buffer_to_base64_function_present(self):
+        """_arrayBufferToBase64 helper must exist for encoding file bytes."""
+        html = _unconfigured_html()
+        self.assertIn("function _arrayBufferToBase64", html,
+                      "_arrayBufferToBase64 function missing from /ui JS")
+
+    def test_base64_used_before_submission(self):
+        """doGDriveIngest must call _arrayBufferToBase64 to encode bytes."""
+        html = _unconfigured_html()
+        start = html.find("async function doGDriveIngest")
+        fn_body = html[start:start + 2000]
+        self.assertIn("_arrayBufferToBase64", fn_body,
+                      "doGDriveIngest must call _arrayBufferToBase64 before submitting")
+
+    def test_payload_includes_scope_and_filename(self):
+        """Payload must include scope and filename fields."""
+        html = _unconfigured_html()
+        start = html.find("async function doGDriveIngest")
+        fn_body = html[start:start + 2000]
+        self.assertIn("scope", fn_body,
+                      "Payload must include scope")
+        self.assertIn("filename", fn_body,
+                      "Payload must include filename")
+
+
+# ---------------------------------------------------------------------------
+# 8. Sheets/Slides rejection
+# ---------------------------------------------------------------------------
+
+class TestGDriveSheetsSlideRejection(unittest.TestCase):
+    """Google Sheets and Google Slides must be rejected at picker selection."""
+
+    def test_unsupported_workspace_set_defined(self):
+        """_GDRIVE_UNSUPPORTED_WORKSPACE must be a Set containing Sheets and Slides mimes."""
+        html = _unconfigured_html()
+        self.assertIn("_GDRIVE_UNSUPPORTED_WORKSPACE", html,
+                      "_GDRIVE_UNSUPPORTED_WORKSPACE not defined in /ui JS")
+
+    def test_sheets_mime_in_unsupported_set(self):
+        """Google Sheets MIME type must be in _GDRIVE_UNSUPPORTED_WORKSPACE."""
+        html = _unconfigured_html()
+        self.assertIn("application/vnd.google-apps.spreadsheet", html,
+                      "Sheets MIME must be in unsupported workspace set")
+
+    def test_slides_mime_in_unsupported_set(self):
+        """Google Slides MIME type must be in _GDRIVE_UNSUPPORTED_WORKSPACE."""
+        html = _unconfigured_html()
+        self.assertIn("application/vnd.google-apps.presentation", html,
+                      "Slides MIME must be in unsupported workspace set")
+
+    def test_picker_callback_checks_unsupported_workspace(self):
+        """_gdrivePickerCallback must check _GDRIVE_UNSUPPORTED_WORKSPACE."""
+        html = _unconfigured_html()
+        start = html.find("function _gdrivePickerCallback")
+        self.assertGreater(start, -1, "_gdrivePickerCallback not found")
+        fn_body = html[start:start + 1500]
+        self.assertIn("_GDRIVE_UNSUPPORTED_WORKSPACE", fn_body,
+                      "Picker callback must check _GDRIVE_UNSUPPORTED_WORKSPACE to reject Sheets/Slides")
+
+    def test_sheets_rejected_with_label(self):
+        """Rejection message must name 'Google Sheets' for spreadsheet MIME."""
+        html = _unconfigured_html()
+        self.assertIn("Google Sheets", html,
+                      "Rejection message must name 'Google Sheets'")
+
+    def test_slides_rejected_with_label(self):
+        """Rejection message must name 'Google Slides' for presentation MIME."""
+        html = _unconfigured_html()
+        self.assertIn("Google Slides", html,
+                      "Rejection message must name 'Google Slides'")
+
+    def test_rejection_disables_ingest_button(self):
+        """Rejection path must disable gdriveBtnIngest."""
+        html = _unconfigured_html()
+        start = html.find("function _gdrivePickerCallback")
+        fn_body = html[start:start + 1500]
+        # After the unsupported-workspace block, ingest button must be re-disabled
+        self.assertIn("gdriveBtnIngest", fn_body,
+                      "Rejection must reference gdriveBtnIngest (to disable it)")
+
+    def test_ui_prose_explains_rejection(self):
+        """UI prose text must state that Sheets/Slides are rejected at selection."""
+        html = _unconfigured_html()
+        self.assertIn("Google Sheets and Google Slides are rejected", html,
+                      "UI must explain Sheets/Slides rejection in the description text")
+
+
+# ---------------------------------------------------------------------------
+# 9. Response handling: 422, 413, verdicts
+# ---------------------------------------------------------------------------
+
+class TestGDriveResponseHandling(unittest.TestCase):
+    """doGDriveIngest must handle all documented response codes and verdicts."""
+
+    def _ingest_fn_body(self) -> str:
+        html = _unconfigured_html()
+        start = html.find("async function doGDriveIngest")
+        self.assertGreater(start, -1, "doGDriveIngest not found")
+        return html[start:start + 5000]
+
+    def test_handles_413_response(self):
+        """doGDriveIngest must detect and report 413 (file too large)."""
+        fn_body = self._ingest_fn_body()
+        self.assertIn("413", fn_body,
+                      "doGDriveIngest must handle HTTP 413 (payload too large)")
+
+    def test_413_message_mentions_limit(self):
+        """413 message must mention the size limit (50 MiB)."""
+        fn_body = self._ingest_fn_body()
+        self.assertIn("50 MiB", fn_body,
+                      "413 error message must state the 50 MiB limit")
+
+    def test_handles_422_response(self):
+        """doGDriveIngest must detect and report 422 (validation error)."""
+        fn_body = self._ingest_fn_body()
+        self.assertIn("422", fn_body,
+                      "doGDriveIngest must handle HTTP 422 (validation error)")
+
+    def test_handles_success_verdict_fetched_new(self):
+        """Verdict 'fetched_new' must appear in the verdict colour map."""
+        fn_body = self._ingest_fn_body()
+        self.assertIn("fetched_new", fn_body,
+                      "fetched_new verdict must be handled in doGDriveIngest")
+
+    def test_handles_verdict_skipped_unchanged(self):
+        """Verdict 'skipped_unchanged' must appear in the verdict colour map."""
+        fn_body = self._ingest_fn_body()
+        self.assertIn("skipped_unchanged", fn_body,
+                      "skipped_unchanged verdict must be handled in doGDriveIngest")
+
+    def test_handles_verdict_fetch_failed(self):
+        """Verdict 'fetch_failed' must appear in the verdict colour map."""
+        fn_body = self._ingest_fn_body()
+        self.assertIn("fetch_failed", fn_body,
+                      "fetch_failed verdict must be handled in doGDriveIngest")
+
+    def test_handles_verdict_fetched_updated(self):
+        """Verdict 'fetched_updated' must appear in the verdict colour map."""
+        fn_body = self._ingest_fn_body()
+        self.assertIn("fetched_updated", fn_body,
+                      "fetched_updated verdict must be handled in doGDriveIngest")
+
+    def test_drive_api_error_handled(self):
+        """Drive API fetch errors must be caught and reported."""
+        fn_body = self._ingest_fn_body()
+        self.assertIn("Drive API error", fn_body,
+                      "Drive API HTTP errors must be surfaced to operator")
+
+    def test_network_error_caught(self):
+        """Network-level errors (fetch failure) must be caught."""
+        fn_body = self._ingest_fn_body()
+        self.assertIn("Network error", fn_body,
+                      "Network errors must be caught and displayed in doGDriveIngest")
+
+
+# ---------------------------------------------------------------------------
+# 10. MIME type support maps
+# ---------------------------------------------------------------------------
+
+class TestGDriveMimeSupport(unittest.TestCase):
+    """Supported and export MIME maps must be consistent with server-side #38 boundary."""
+
+    def test_direct_map_includes_pdf(self):
+        """_GDRIVE_DIRECT must include application/pdf → pdf."""
+        html = _unconfigured_html()
+        self.assertIn("'application/pdf': 'pdf'", html,
+                      "_GDRIVE_DIRECT must map application/pdf to 'pdf'")
+
+    def test_direct_map_includes_docx(self):
+        """_GDRIVE_DIRECT must include OOXML DOCX MIME."""
+        html = _unconfigured_html()
+        self.assertIn("application/vnd.openxmlformats-officedocument.wordprocessingml.document", html,
+                      "_GDRIVE_DIRECT must include DOCX MIME type")
+
+    def test_direct_map_includes_html(self):
+        """_GDRIVE_DIRECT must map text/html → html."""
+        html = _unconfigured_html()
+        self.assertIn("'text/html': 'html'", html,
+                      "_GDRIVE_DIRECT must map text/html to 'html'")
+
+    def test_export_map_google_docs_to_docx(self):
+        """_GDRIVE_EXPORT must map Google Docs to DOCX export."""
+        html = _unconfigured_html()
+        self.assertIn("application/vnd.google-apps.document", html,
+                      "_GDRIVE_EXPORT must include Google Docs MIME for DOCX export")
+
+    def test_infer_format_function_present(self):
+        """_gdriveInferFormat helper must be defined."""
+        html = _unconfigured_html()
+        self.assertIn("function _gdriveInferFormat", html,
+                      "_gdriveInferFormat function missing from /ui JS")
+
+    def test_supported_formats_listed_in_prose(self):
+        """UI prose must list supported formats for operator guidance."""
+        html = _unconfigured_html()
+        self.assertIn("PDF", html)
+        self.assertIn("DOCX", html)
+        self.assertIn("Google Docs", html)
+
+
+# ---------------------------------------------------------------------------
+# 11–12. No new routes or modules added
+# ---------------------------------------------------------------------------
+
+class TestNoNewRoutesOrModules(unittest.TestCase):
+    """W-C3.4 must not add new HTTP routes or Python modules."""
+
+    def test_no_new_gdrive_route_in_connector_routes(self):
+        """connector_routes.py must not have a dedicated /gdrive endpoint."""
+        connector_routes_path = os.path.join(
+            os.path.dirname(__file__), "..", "src", "api", "connector_routes.py"
+        )
+        with open(connector_routes_path) as f:
+            content = f.read()
+        # The only connector route added for W-C3.4 is browser-side — no new /gdrive HTTP route
+        self.assertNotIn('"/connectors/gdrive"', content,
+                         "connector_routes.py must not expose a /connectors/gdrive endpoint "
+                         "(W-C3.4 is browser-side only)")
+        self.assertNotIn("@router.post(\"/connectors/gdrive", content,
+                         "connector_routes.py must not have a /connectors/gdrive POST route")
+
+    def test_no_new_gdrive_route_in_s3_routes(self):
+        """s3_routes.py must not have a /gdrive endpoint."""
+        s3_routes_path = os.path.join(
+            os.path.dirname(__file__), "..", "src", "api", "s3_routes.py"
+        )
+        if not os.path.exists(s3_routes_path):
+            return  # s3_routes.py may not exist — pass
+        with open(s3_routes_path) as f:
+            content = f.read()
+        self.assertNotIn("gdrive", content.lower(),
+                         "s3_routes.py must not reference gdrive — wrong module")
+
+    def test_routes_py_imports_no_new_gdrive_module(self):
+        """routes.py must not import a new gdrive-specific Python module for W-C3.4."""
+        routes_path = os.path.join(
+            os.path.dirname(__file__), "..", "src", "api", "routes.py"
+        )
+        with open(routes_path) as f:
+            content = f.read()
+        # W-C3.4 must not import a new top-level module like 'google_drive_picker' or 'gdrive_ui'
+        self.assertNotIn("import google_drive_picker", content,
+                         "routes.py must not import a new google_drive_picker module (W-C3.4 is inline JS only)")
+        self.assertNotIn("import gdrive_ui", content,
+                         "routes.py must not import a new gdrive_ui module")
+
+    def test_gdrive_config_in_settings(self):
+        """Settings must expose picker config fields (google_picker_api_key etc.)."""
+        from config import Settings
+        s = Settings()
+        # Fields must exist (may be empty strings in test env)
+        self.assertTrue(hasattr(s, "google_picker_api_key"),
+                        "Settings must have google_picker_api_key")
+        self.assertTrue(hasattr(s, "google_picker_client_id"),
+                        "Settings must have google_picker_client_id")
+        self.assertTrue(hasattr(s, "google_picker_app_id"),
+                        "Settings must have google_picker_app_id")
+
+
+# ---------------------------------------------------------------------------
+# 13. operator_ui() dynamic config injection
+# ---------------------------------------------------------------------------
+
+class TestOperatorUiDynamicConfig(unittest.TestCase):
+    """operator_ui() must inject _GDRIVE_CFG from env vars on each request."""
+
+    def test_placeholder_not_in_output(self):
+        """The raw placeholder comment must not appear in rendered output."""
+        html = _unconfigured_html()
+        self.assertNotIn("/* GDRIVE_CONFIG_PLACEHOLDER */", html,
+                         "Placeholder comment must be replaced by config injection")
+
+    def test_gdrive_cfg_declaration_always_present(self):
+        """_GDRIVE_CFG const must always be declared (even when empty)."""
+        html = _unconfigured_html()
+        self.assertIn("const _GDRIVE_CFG = {", html,
+                      "_GDRIVE_CFG must always be declared in rendered /ui")
+
+    def test_configured_values_distinct_from_empty(self):
+        """Configured render must differ from unconfigured render at _GDRIVE_CFG."""
+        unconfigured = _unconfigured_html()
+        configured = _configured_html()
+        # Both must have _GDRIVE_CFG, but values must differ
+        self.assertIn("const _GDRIVE_CFG = {", unconfigured)
+        self.assertIn("const _GDRIVE_CFG = {", configured)
+        # The key difference: apiKey should be empty in one, non-empty in the other
+        self.assertIn('apiKey:""', unconfigured)
+        self.assertNotIn('apiKey:""', configured)
+
+
+# ---------------------------------------------------------------------------
+# 14. Button wiring
+# ---------------------------------------------------------------------------
+
+class TestGDriveButtonWiring(unittest.TestCase):
+    """Picker and ingest buttons must be wired to the correct JS functions."""
+
+    def test_pick_button_calls_doGDrivePick(self):
+        """gdriveBtnPick onclick must call doGDrivePick()."""
+        html = _unconfigured_html()
+        idx = html.find('id="gdriveBtnPick"')
+        surroundings = html[max(0, idx - 20):idx + 200]
+        self.assertIn("doGDrivePick()", surroundings,
+                      "gdriveBtnPick button must call doGDrivePick() on click")
+
+    def test_ingest_button_calls_doGDriveIngest(self):
+        """gdriveBtnIngest onclick must call doGDriveIngest()."""
+        html = _unconfigured_html()
+        idx = html.find('id="gdriveBtnIngest"')
+        surroundings = html[max(0, idx - 20):idx + 250]
+        self.assertIn("doGDriveIngest()", surroundings,
+                      "gdriveBtnIngest button must call doGDriveIngest() on click")
+
+    def test_do_gdrive_pick_function_defined(self):
+        """doGDrivePick function must be defined in the script block."""
+        html = _unconfigured_html()
+        self.assertIn("function doGDrivePick()", html,
+                      "doGDrivePick function missing from /ui JS")
+
+    def test_do_gdrive_ingest_function_defined(self):
+        """doGDriveIngest function must be defined in the script block."""
+        html = _unconfigured_html()
+        self.assertIn("async function doGDriveIngest()", html,
+                      "doGDriveIngest function missing from /ui JS")
+
+    def test_open_picker_function_defined(self):
+        """_gdriveOpenPicker function must be defined (called after token obtained)."""
+        html = _unconfigured_html()
+        self.assertIn("function _gdriveOpenPicker()", html,
+                      "_gdriveOpenPicker function missing from /ui JS")
+
+    def test_picker_callback_function_defined(self):
+        """_gdrivePickerCallback function must be defined."""
+        html = _unconfigured_html()
+        self.assertIn("function _gdrivePickerCallback(", html,
+                      "_gdrivePickerCallback function missing from /ui JS")
+
+
+if __name__ == "__main__":
+    unittest.main()

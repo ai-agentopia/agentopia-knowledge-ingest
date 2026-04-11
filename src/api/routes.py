@@ -7,6 +7,7 @@ Document processing runs in FastAPI BackgroundTasks (synchronous pipeline day-1)
 """
 
 import hashlib
+import json
 import logging
 import re
 from typing import Any
@@ -272,7 +273,16 @@ async def rollback_document(document_id: str, body: RollbackRequest) -> dict:
 
 @router.get("/ui", response_class=HTMLResponse, include_in_schema=False)
 async def operator_ui() -> str:
-    return _OPERATOR_UI_HTML
+    """Render the operator console with Google Drive picker config injected from env."""
+    s = get_settings()
+    cfg_js = (
+        "const _GDRIVE_CFG = {"
+        f"apiKey:{json.dumps(s.google_picker_api_key)},"
+        f"clientId:{json.dumps(s.google_picker_client_id)},"
+        f"appId:{json.dumps(s.google_picker_app_id)}"
+        "};"
+    )
+    return _OPERATOR_UI_HTML.replace("/* GDRIVE_CONFIG_PLACEHOLDER */", cfg_js)
 
 
 _OPERATOR_UI_HTML = """<!DOCTYPE html>
@@ -503,7 +513,56 @@ _OPERATOR_UI_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- ── Google Drive Picker (W-C3.4) ──────────────────────────────────── -->
+  <div class="section">
+    <h2 id="hGDrive" onclick="toggle('sGDrive','hGDrive')">&#x1F4C1; Google Drive Ingest</h2>
+    <div id="sGDrive" class="section-body">
+      <p style="font-size:0.82rem;color:#555;margin-top:0">
+        Select a file from Google Drive in-browser. The file is fetched client-side
+        and submitted to <code>POST /connectors/ingest</code> as base64-encoded bytes.
+        Source URI format: <code>gdrive://{fileId}</code>.
+        Credentials are obtained in-browser only — no tokens are sent to or stored on this server.
+      </p>
+      <p style="font-size:0.82rem;color:#555;margin:0 0 10px">
+        <strong>Supported:</strong> PDF, DOCX, HTML, Markdown/text, Google Docs (exported as DOCX).
+        <strong>Not supported:</strong> Google Sheets and Google Slides are rejected at selection.
+      </p>
+      <div id="gdriveConfigWarning" style="display:none;background:#fff3cd;border:1px solid #ffc107;border-radius:4px;padding:10px 14px;margin-bottom:12px;font-size:0.82rem;color:#664d03">
+        <strong>Picker not configured.</strong>
+        Set <code>GOOGLE_PICKER_API_KEY</code> and <code>GOOGLE_PICKER_CLIENT_ID</code>
+        environment variables to enable the Google Drive picker in this console.
+      </div>
+      <div class="row">
+        <div>
+          <label>Scope (tenant/domain)</label>
+          <input id="gdriveScope" placeholder="joblogic-kb/gdrive-docs">
+          <label>Owner (optional)</label>
+          <input id="gdriveOwner" placeholder="operator@example.com">
+        </div>
+        <div>
+          <label>Selected file</label>
+          <input id="gdriveFileName" placeholder="(none selected)" readonly
+                 style="background:#f8f9fa;color:#555">
+          <label>source_uri</label>
+          <input id="gdriveSourceUri" placeholder="gdrive://..." readonly
+                 style="background:#f8f9fa;color:#555;font-family:monospace;font-size:0.78rem">
+          <label>Format</label>
+          <input id="gdriveFormat" placeholder="" readonly
+                 style="background:#f8f9fa;color:#555;width:120px">
+        </div>
+      </div>
+      <div class="actions">
+        <button id="gdriveBtnPick" onclick="doGDrivePick()">Open Google Drive Picker</button>
+        <button id="gdriveBtnIngest" onclick="doGDriveIngest()" class="secondary"
+                disabled style="opacity:0.5">Submit to /connectors/ingest</button>
+      </div>
+      <div id="gdriveOut" class="output" style="margin-top:8px">Ready.</div>
+    </div>
+  </div>
+
   <script>
+  /* GDRIVE_CONFIG_PLACEHOLDER */
+
   // ── Helpers ────────────────────────────────────────────────────────────────
 
   function toggle(bodyId, headId) {
@@ -889,6 +948,236 @@ _OPERATOR_UI_HTML = """<!DOCTYPE html>
           </tr>`;
         }).join('') + '</tbody></table>';
     } catch (e) { outEl.textContent = 'Error: ' + e.message; }
+  }
+
+  // ── Google Drive Picker (W-C3.4) ──────────────────────────────────────────
+  // Identity contract (knowledge-ingest#38 / #48):
+  //   connector_module = "google_drive"
+  //   source_uri       = "gdrive://{fileId}"  — stable across renames
+  //
+  // This is a browser-side path only. The server-side sync wrapper (#38) is a
+  // separate, independent path. No server-side token storage occurs here.
+
+  // Supported MIME types — must stay aligned with server-side wrapper (#38).
+  const _GDRIVE_DIRECT = {
+    'application/pdf': 'pdf',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+    'text/html': 'html',
+    'text/markdown': 'markdown',
+    'text/x-markdown': 'markdown',
+    'text/plain': 'txt',
+  };
+  // Google Workspace types exported server-side to a supported format.
+  const _GDRIVE_EXPORT = {
+    'application/vnd.google-apps.document': {
+      exportMime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      format: 'docx',
+    },
+  };
+  // Workspace types that export to formats NOT supported by the normalizer.
+  const _GDRIVE_UNSUPPORTED_WORKSPACE = new Set([
+    'application/vnd.google-apps.spreadsheet',  // xlsx — not supported
+    'application/vnd.google-apps.presentation', // pptx — not supported
+  ]);
+
+  function _gdriveInferFormat(mimeType) {
+    if (_GDRIVE_DIRECT[mimeType]) return { format: _GDRIVE_DIRECT[mimeType], exportMime: null };
+    if (_GDRIVE_EXPORT[mimeType]) return _GDRIVE_EXPORT[mimeType];
+    return null;
+  }
+
+  // Session-scoped access token — not persisted to storage.
+  let _gdriveAccessToken = null;
+  let _gdriveSelectedFile = null;  // { id, name, mimeType }
+  let _gdriveLibsLoaded = false;
+
+  function _gdriveConfigured() {
+    return !!(typeof _GDRIVE_CFG !== 'undefined' && _GDRIVE_CFG.apiKey && _GDRIVE_CFG.clientId);
+  }
+
+  // Show config warning and disable picker button if env vars are missing.
+  (function _initGDriveConfigState() {
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', _initGDriveConfigState);
+      return;
+    }
+    if (!_gdriveConfigured()) {
+      const warn = document.getElementById('gdriveConfigWarning');
+      const btn  = document.getElementById('gdriveBtnPick');
+      if (warn) warn.style.display = 'block';
+      if (btn)  { btn.disabled = true; btn.style.opacity = '0.45'; btn.title = 'GOOGLE_PICKER_API_KEY and GOOGLE_PICKER_CLIENT_ID must be set'; }
+    }
+  })();
+
+  function _gdriveLoadLibs(callback) {
+    if (_gdriveLibsLoaded) { callback(); return; }
+    // Load gapi (Picker) and GIS (OAuth token) scripts
+    let loaded = 0;
+    function onLoaded() { if (++loaded === 2) { _gdriveLibsLoaded = true; callback(); } }
+    const gapiScript = document.createElement('script');
+    gapiScript.src = 'https://apis.google.com/js/api.js';
+    gapiScript.onload = () => gapi.load('picker', onLoaded);
+    document.head.appendChild(gapiScript);
+    const gisScript = document.createElement('script');
+    gisScript.src = 'https://accounts.google.com/gsi/client';
+    gisScript.onload = onLoaded;
+    document.head.appendChild(gisScript);
+  }
+
+  function doGDrivePick() {
+    const outEl = document.getElementById('gdriveOut');
+    if (!_gdriveConfigured()) {
+      outEl.textContent = 'Picker not configured. Set GOOGLE_PICKER_API_KEY and GOOGLE_PICKER_CLIENT_ID.';
+      return;
+    }
+    outEl.textContent = 'Loading Google Drive picker...';
+    _gdriveLoadLibs(() => {
+      const tokenClient = google.accounts.oauth2.initTokenClient({
+        client_id: _GDRIVE_CFG.clientId,
+        scope: 'https://www.googleapis.com/auth/drive.readonly',
+        callback: (resp) => {
+          if (resp.error) { outEl.textContent = 'OAuth error: ' + resp.error; return; }
+          _gdriveAccessToken = resp.access_token;
+          _gdriveOpenPicker();
+        },
+      });
+      tokenClient.requestAccessToken({ prompt: '' });
+    });
+  }
+
+  function _gdriveOpenPicker() {
+    const outEl = document.getElementById('gdriveOut');
+    try {
+      const view = new google.picker.DocsView(google.picker.ViewId.DOCS)
+        .setIncludeFolders(false)
+        .setSelectFolderEnabled(false);
+      const builder = new google.picker.PickerBuilder()
+        .addView(view)
+        .setOAuthToken(_gdriveAccessToken)
+        .setDeveloperKey(_GDRIVE_CFG.apiKey)
+        .setCallback(_gdrivePickerCallback);
+      if (_GDRIVE_CFG.appId) builder.setAppId(_GDRIVE_CFG.appId);
+      builder.build().setVisible(true);
+      outEl.textContent = 'Picker open — select a file.';
+    } catch (e) { outEl.textContent = 'Picker error: ' + e.message; }
+  }
+
+  function _gdrivePickerCallback(data) {
+    const outEl = document.getElementById('gdriveOut');
+    if (data.action !== google.picker.Action.PICKED) return;
+    const doc = data.docs[0];
+    const mime = doc.mimeType || '';
+
+    // Reject Google Sheets and Google Slides explicitly.
+    if (_GDRIVE_UNSUPPORTED_WORKSPACE.has(mime)) {
+      const label = mime.includes('spreadsheet') ? 'Google Sheets' : 'Google Slides';
+      outEl.textContent = `${label} is not supported. Please select a PDF, DOCX, HTML, Markdown, or Google Docs file.`;
+      _gdriveSelectedFile = null;
+      document.getElementById('gdriveBtnIngest').disabled = true;
+      document.getElementById('gdriveBtnIngest').style.opacity = '0.5';
+      return;
+    }
+
+    const inferred = _gdriveInferFormat(mime);
+    if (!inferred) {
+      outEl.textContent = `Unsupported file type: ${mime}. Supported: PDF, DOCX, HTML, Markdown, plain text, Google Docs.`;
+      _gdriveSelectedFile = null;
+      document.getElementById('gdriveBtnIngest').disabled = true;
+      document.getElementById('gdriveBtnIngest').style.opacity = '0.5';
+      return;
+    }
+
+    _gdriveSelectedFile = { id: doc.id, name: doc.name, mimeType: mime, format: inferred.format, exportMime: inferred.exportMime || null };
+    document.getElementById('gdriveFileName').value = doc.name;
+    document.getElementById('gdriveSourceUri').value = 'gdrive://' + doc.id;
+    document.getElementById('gdriveFormat').value = inferred.format;
+    const btn = document.getElementById('gdriveBtnIngest');
+    btn.disabled = false;
+    btn.style.opacity = '1';
+    outEl.textContent = `Selected: ${doc.name} (${mime}) → format: ${inferred.format}\\nsource_uri: gdrive://${doc.id}\\nReady to submit.`;
+  }
+
+  function _arrayBufferToBase64(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    // Process in 8 KB chunks to avoid stack overflow on large files.
+    const CHUNK = 8192;
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+    }
+    return btoa(binary);
+  }
+
+  async function doGDriveIngest() {
+    const outEl = document.getElementById('gdriveOut');
+    const scope = document.getElementById('gdriveScope').value.trim();
+    const owner = document.getElementById('gdriveOwner').value.trim();
+    if (!scope) { outEl.textContent = 'Scope is required.'; return; }
+    if (!_gdriveSelectedFile) { outEl.textContent = 'No file selected. Open the picker first.'; return; }
+    if (!_gdriveAccessToken) { outEl.textContent = 'No access token. Re-open the picker to re-authenticate.'; return; }
+
+    const { id: fileId, name: fileName, format, exportMime } = _gdriveSelectedFile;
+    const sourceUri = 'gdrive://' + fileId;
+
+    outEl.textContent = `Fetching file bytes from Google Drive...\\n(${fileName})`;
+
+    let arrayBuf;
+    try {
+      const url = exportMime
+        ? `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}/export?mimeType=${encodeURIComponent(exportMime)}`
+        : `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`;
+      const resp = await fetch(url, { headers: { 'Authorization': 'Bearer ' + _gdriveAccessToken } });
+      if (!resp.ok) {
+        outEl.textContent = `Drive API error ${resp.status}: ${await resp.text()}`;
+        return;
+      }
+      arrayBuf = await resp.arrayBuffer();
+    } catch (e) {
+      outEl.textContent = 'Failed to fetch file from Google Drive: ' + e.message;
+      return;
+    }
+
+    const raw_bytes_b64 = _arrayBufferToBase64(arrayBuf);
+    outEl.textContent = `Fetched ${arrayBuf.byteLength} bytes. Submitting to /connectors/ingest...`;
+
+    const payload = {
+      connector_module: 'google_drive',
+      scope,
+      source_uri: sourceUri,
+      filename: fileName,
+      format,
+      raw_bytes_b64,
+    };
+    if (owner) payload.owner = owner;
+
+    try {
+      const resp = await fetch('/connectors/ingest', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await resp.json();
+      if (resp.status === 413) {
+        outEl.textContent = 'Error 413: File too large (limit 50 MiB). ' + (data.detail || '');
+        return;
+      }
+      if (resp.status === 422) {
+        outEl.textContent = 'Error 422: ' + (data.detail || JSON.stringify(data));
+        return;
+      }
+      if (!resp.ok) {
+        outEl.textContent = 'Error ' + resp.status + ': ' + (data.detail || resp.statusText);
+        return;
+      }
+      const verdictColor = { fetched_new: '#155724', fetched_updated: '#004085', skipped_unchanged: '#383d41', fetch_failed: '#721c24' };
+      const color = verdictColor[data.verdict] || '#383d41';
+      outEl.innerHTML = `<span style="color:${color};font-weight:600">${data.verdict}</span>` +
+        `\\ntask_id: ${data.task_id || '-'}` +
+        (data.document_id ? `\\ndocument_id: ${data.document_id}` : '') +
+        (data.version     ? `  v${data.version}` : '') +
+        (data.job_id      ? `\\njob_id: ${data.job_id}` : '') +
+        (data.error_message ? `\\nerror: ${data.error_message}` : '');
+    } catch (e) { outEl.textContent = 'Network error: ' + e.message; }
   }
   </script>
 </body>
