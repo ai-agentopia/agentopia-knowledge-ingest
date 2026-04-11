@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from api.connector_routes import router as connector_router
 from api.routes import router
 from config import get_settings
 
@@ -89,3 +90,4 @@ app = FastAPI(
 )
 
 app.include_router(router)
+app.include_router(connector_router)

@@ -3,25 +3,35 @@
 Issue:  knowledge-ingest#42
 ADR:    docs/adr/002-connector-precondition-audit.md (W-C3.1 trigger condition)
 
-Architecture
-------------
-This test boundary:
-  - ingest_from_connector() is stubbed (no adapter logic runs).
-  - FastAPI TestClient is used (no real network).
-  - No DB, no orchestrator, no storage.
+Test boundary
+-------------
+- ingest_from_connector() is stubbed via unittest.mock.patch — no adapter logic runs.
+- FastAPI TestClient is used — no real network.
+- No DB, no orchestrator, no storage runs in any test in this file.
+- Patch target: "api.connector_routes.ingest_from_connector"
 
-The route is a thin transport wrapper. Tests verify:
-  1. All four adapter verdicts return HTTP 200.
-  2. SyncResult fields are serialised correctly to JSON.
-  3. Malformed body returns 422.
-  4. Invalid base64 returns 422.
-  5. Oversized decoded payload returns 413.
-  6. Missing required fields return 422.
-  7. Invalid format returns 422.
-  8. ConnectorEvent constructed with correct field values from request.
+Tests cover:
+  1. Valid request → adapter called with correct ConnectorEvent fields
+  2. Invalid base64 → 422
+  3. Oversized base64 string (pre-decode check) → 413 without allocating decoded bytes
+  4. Adapter returns fetched_new → 200 with serialised SyncResult
+  5. Adapter returns fetched_updated → 200 with serialised SyncResult
+  6. Adapter returns skipped_unchanged → 200 with serialised SyncResult
+  7. Adapter returns fetch_failed → 200 (NOT 4xx) with serialised SyncResult
+  8. Scope/business errors not reimplemented in route (fetch_failed passthrough test)
+  9. Route module (connector_routes) does NOT import db.registry, db.connector_sync,
+     or orchestrator — verified by static source inspection
+ 10. Optional fields default correctly
+ 11. Missing required fields → 422
+ 12. Invalid format → 422
+ 13. Empty required string fields → 422
+ 14. Post-decode size guard (defence-in-depth) → 413
+ 15. Exactly-at-limit b64 length is accepted
 """
 
 import base64
+import inspect
+import math
 from dataclasses import dataclass
 from typing import Optional
 from unittest.mock import patch
@@ -29,17 +39,17 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
-# ---------------------------------------------------------------------------
-# App import — PYTHONPATH=src required (same as other tests in this project)
-# ---------------------------------------------------------------------------
-
+# PYTHONPATH=src required (same as all other tests in this project)
 from main import app  # noqa: E402
 
 client = TestClient(app)
 
-_MOD = "api.routes"  # module where ingest_from_connector is imported at call time
-
+_MOD = "api.connector_routes"   # narrow module; does not import db.* or orchestrator
 _ENDPOINT = "/connectors/ingest"
+
+_MAX_DECODED_BYTES = 50 * 1024 * 1024
+_MAX_B64_CHARS = math.ceil(_MAX_DECODED_BYTES / 3) * 4
+
 
 # ---------------------------------------------------------------------------
 # Stub helpers
@@ -73,7 +83,51 @@ def _minimal_body(**overrides) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Verdict tests — all four verdicts must produce HTTP 200
+# 1. Static isolation test — route module must not import db or orchestrator
+# ---------------------------------------------------------------------------
+
+class TestRouteIsolation:
+    def test_connector_routes_does_not_import_db_or_orchestrator(self):
+        """Verify api.connector_routes has no direct dependency on db.* or orchestrator.
+
+        Reads the source file as text and asserts the forbidden import prefixes are absent.
+        This test enforces the W-C3.1 isolation requirement: all business logic must
+        remain in ingest_from_connector(), not in the HTTP transport layer.
+        """
+        import importlib
+        import pathlib
+
+        mod = importlib.import_module("api.connector_routes")
+        source_path = pathlib.Path(inspect.getfile(mod))
+        source = source_path.read_text()
+
+        # Check only non-comment, non-docstring lines for forbidden import statements.
+        # A line is an import statement if it starts with "import " or "from "
+        # (after stripping leading whitespace). This avoids false positives from
+        # docstrings or comments that describe what is NOT imported.
+        import_lines = [
+            line.strip()
+            for line in source.splitlines()
+            if line.strip().startswith(("import ", "from "))
+        ]
+        import_source = "\n".join(import_lines)
+
+        forbidden_prefixes = [
+            "from db",
+            "import db",
+            "from orchestrator",
+            "import orchestrator",
+        ]
+        for pattern in forbidden_prefixes:
+            assert not any(line.startswith(pattern) for line in import_lines), (
+                f"api/connector_routes.py must not contain the import statement '{pattern}'. "
+                f"All DB and orchestrator access must remain in ingest_from_connector().\n"
+                f"Import lines found:\n{import_source}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# 2. Adapter verdict tests — all four verdicts must produce HTTP 200
 # ---------------------------------------------------------------------------
 
 class TestAllVerdicts:
@@ -125,7 +179,7 @@ class TestAllVerdicts:
         assert data["version"] is None
 
     def test_fetch_failed_returns_200_not_4xx(self):
-        """fetch_failed is an adapter verdict — must return 200, not an error status."""
+        """fetch_failed is an adapter verdict — must NOT be converted to an HTTP error."""
         result = _SyncResult(
             task_id="task-004",
             verdict="fetch_failed",
@@ -141,7 +195,7 @@ class TestAllVerdicts:
 
 
 # ---------------------------------------------------------------------------
-# ConnectorEvent construction verification
+# 3. ConnectorEvent construction
 # ---------------------------------------------------------------------------
 
 class TestEventConstruction:
@@ -200,92 +254,103 @@ class TestEventConstruction:
 
 
 # ---------------------------------------------------------------------------
-# Validation errors — 422
+# 4. Validation errors — 422
 # ---------------------------------------------------------------------------
 
 class TestValidationErrors:
     def test_missing_connector_module_returns_422(self):
         body = _minimal_body()
         del body["connector_module"]
-        resp = client.post(_ENDPOINT, json=body)
-        assert resp.status_code == 422
+        assert client.post(_ENDPOINT, json=body).status_code == 422
 
     def test_missing_source_uri_returns_422(self):
         body = _minimal_body()
         del body["source_uri"]
-        resp = client.post(_ENDPOINT, json=body)
-        assert resp.status_code == 422
+        assert client.post(_ENDPOINT, json=body).status_code == 422
 
     def test_missing_raw_bytes_b64_returns_422(self):
         body = _minimal_body()
         del body["raw_bytes_b64"]
-        resp = client.post(_ENDPOINT, json=body)
-        assert resp.status_code == 422
+        assert client.post(_ENDPOINT, json=body).status_code == 422
 
     def test_invalid_format_returns_422(self):
-        body = _minimal_body(format="xlsx")
-        resp = client.post(_ENDPOINT, json=body)
-        assert resp.status_code == 422
+        assert client.post(_ENDPOINT, json=_minimal_body(format="xlsx")).status_code == 422
 
     def test_empty_connector_module_returns_422(self):
-        body = _minimal_body(connector_module="")
-        resp = client.post(_ENDPOINT, json=body)
-        assert resp.status_code == 422
+        assert client.post(_ENDPOINT, json=_minimal_body(connector_module="")).status_code == 422
 
     def test_empty_source_uri_returns_422(self):
-        body = _minimal_body(source_uri="")
-        resp = client.post(_ENDPOINT, json=body)
-        assert resp.status_code == 422
+        assert client.post(_ENDPOINT, json=_minimal_body(source_uri="")).status_code == 422
 
 
 # ---------------------------------------------------------------------------
-# Invalid base64 — 422
+# 5. Base64 errors — 422
 # ---------------------------------------------------------------------------
 
 class TestBase64Errors:
     def test_invalid_base64_returns_422(self):
-        body = _minimal_body(raw_bytes_b64="not-valid-base64!!!")
-        resp = client.post(_ENDPOINT, json=body)
+        resp = client.post(_ENDPOINT, json=_minimal_body(raw_bytes_b64="not-valid-base64!!!"))
         assert resp.status_code == 422
         assert "base64" in resp.json()["detail"].lower()
 
-    def test_empty_raw_bytes_b64_is_valid_empty_doc(self):
-        """Empty string decodes to 0 bytes — valid at transport layer."""
+    def test_empty_raw_bytes_decodes_to_zero_bytes_passes_transport(self):
+        """Empty base64 string decodes to 0 bytes — valid at transport layer."""
         result = _SyncResult(task_id="t1", verdict="fetched_new",
                              document_id="d1", job_id="j1", version=1)
-        body = _minimal_body(raw_bytes_b64=_b64(b""))
         with patch(f"{_MOD}.ingest_from_connector", return_value=result):
-            resp = client.post(_ENDPOINT, json=body)
+            resp = client.post(_ENDPOINT, json=_minimal_body(raw_bytes_b64=_b64(b"")))
         assert resp.status_code == 200
 
 
 # ---------------------------------------------------------------------------
-# Oversized payload — 413
+# 6. Payload size — 413 enforced BEFORE decode
 # ---------------------------------------------------------------------------
 
 class TestSizeLimit:
-    def test_oversized_payload_returns_413(self):
-        """Decoded payload > 50 MiB must return 413, not 200."""
-        # Patch to avoid actually encoding 50 MiB in CI.
-        # We mock the b64decode to return an oversized byte string.
-        oversized = b"x" * (50 * 1024 * 1024 + 1)
-        body = _minimal_body(raw_bytes_b64=_b64(b"small"))
+    def test_oversized_b64_string_rejected_before_decode(self):
+        """Pre-decode guard: b64 string length > _MAX_B64_CHARS returns 413.
 
-        with patch("api.routes.base64.b64decode", return_value=oversized):
-            resp = client.post(_ENDPOINT, json=body)
-
+        The oversized b64 string is built in-process but b64decode is NOT called
+        by the route — the string-length check fires first. This verifies that
+        unbounded memory allocation never occurs.
+        """
+        # A b64 string one character longer than the allowed maximum.
+        # Actual b64decode is never called because the pre-check fires first.
+        oversized_b64 = "A" * (_MAX_B64_CHARS + 1)
+        resp = client.post(_ENDPOINT, json=_minimal_body(raw_bytes_b64=oversized_b64))
         assert resp.status_code == 413
         assert "50" in resp.json()["detail"]
 
-    def test_exactly_at_limit_is_accepted(self):
-        """Payload exactly at 50 MiB boundary must NOT return 413."""
-        at_limit = b"x" * (50 * 1024 * 1024)
+    def test_b64_string_exactly_at_limit_is_accepted(self):
+        """b64 string at exactly _MAX_B64_CHARS characters does not trigger the pre-check.
+
+        We mock b64decode to avoid allocating 50 MiB in CI and mock ingest_from_connector
+        to complete the request.
+        """
+        at_limit_b64 = "A" * _MAX_B64_CHARS
+
         result = _SyncResult(task_id="t1", verdict="fetched_new",
                              document_id="d1", job_id="j1", version=1)
-        body = _minimal_body(raw_bytes_b64=_b64(b"small"))
 
-        with patch("api.routes.base64.b64decode", return_value=at_limit):
+        # Return bytes that fit within the limit
+        safe_decoded = b"x" * 100
+        with patch(f"{_MOD}.base64.b64decode", return_value=safe_decoded):
             with patch(f"{_MOD}.ingest_from_connector", return_value=result):
-                resp = client.post(_ENDPOINT, json=body)
+                resp = client.post(_ENDPOINT, json=_minimal_body(raw_bytes_b64=at_limit_b64))
 
         assert resp.status_code == 200
+
+    def test_post_decode_size_guard_rejects_pathological_payload(self):
+        """Defence-in-depth: if b64decode somehow returns > _MAX_DECODED_BYTES,
+        the post-decode guard returns 413.
+
+        This guards against non-standard b64 encoders that produce shorter
+        strings than the canonical encoding for the same decoded size.
+        """
+        oversized_decoded = b"x" * (_MAX_DECODED_BYTES + 1)
+        # The b64 string itself is short (passes pre-check); only the decoded
+        # output exceeds the limit.
+        with patch(f"{_MOD}.base64.b64decode", return_value=oversized_decoded):
+            resp = client.post(_ENDPOINT, json=_minimal_body())
+
+        assert resp.status_code == 413
