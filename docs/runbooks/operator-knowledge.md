@@ -499,6 +499,7 @@ wrapper (knowledge-ingest#41). Do not use this endpoint for IBM COS.
 | Configure scope mapping (file) | `CONNECTOR_SCOPE_MAPPINGS_FILE=/path/to/rules.json` |
 | HTTP connector ingest (generic) | `POST /connectors/ingest` |
 | AWS S3 sync trigger (UI or API) | `POST /connectors/s3/sync` |
+| Google Drive sync (script) | `sync_gdrive(config)` |
 
 ---
 
@@ -594,29 +595,57 @@ integration is a future issue.
 
 ---
 
-## 12. Configure and Run the AWS S3 Connector (W-C2.1)
+## 14. Configure and Run the Google Drive Connector (W-C2.2)
 
-The AWS S3 connector pulls documents from S3-compatible object storage into a
-knowledge scope. It uses the `ingest_from_connector()` adapter (W-C1) — all scope
-validation, dedup, versioning, and provenance rules apply unchanged.
+The Google Drive connector pulls documents from Google Drive into a knowledge scope.
+It uses the `ingest_from_connector()` adapter (W-C1) — all scope validation, dedup,
+versioning, and provenance rules apply unchanged.
 
-**Source:** `langflow-ai/openrag` `src/connectors/aws_s3/connector.py` (adapted).
-**Implementation:** `src/connectors/openrag_s3.py`, `src/connectors/aws_s3_wrapper.py`.
-**Issue:** knowledge-ingest#37.
+**Source:** `langflow-ai/openrag` `src/connectors/google_drive/` (adapted).
+**Implementation:** `src/connectors/openrag_gdrive.py`, `src/connectors/google_drive_wrapper.py`.
+**Issue:** knowledge-ingest#38.
 
 ### Prerequisites
 
-1. Create the target scope (if not already done):
+1. Create a Google Cloud project and enable the Google Drive API.
+
+2. Create an OAuth 2.0 client ID (Desktop or Web application type).
+   Download the client credentials JSON from the Google Cloud Console.
+
+3. Run the OAuth setup flow **once** to obtain a refresh token and store it in the
+   token file. The service account or operator must complete this browser flow
+   out-of-band. The token file is then stored in managed secret storage.
+   ```bash
+   # Example using google-auth-oauthlib (outside this service):
+   python -c "
+   from google_auth_oauthlib.flow import InstalledAppFlow
+   import json
+   flow = InstalledAppFlow.from_client_secrets_file(
+       'credentials.json',
+       scopes=['https://www.googleapis.com/auth/drive.readonly',
+               'https://www.googleapis.com/auth/drive.metadata.readonly']
+   )
+   creds = flow.run_local_server()
+   token_data = {'token': creds.token, 'refresh_token': creds.refresh_token, 'scopes': list(creds.scopes)}
+   open('gdrive_token.json', 'w').write(json.dumps(token_data, indent=2))
+   print('Token saved to gdrive_token.json')
+   "
+   ```
+
+4. Store the token file in managed secret storage (K8s Secret or Vault) and mount
+   it to the service at the configured `token_file` path.
+
+5. Create the target scope:
    ```bash
    curl -X POST http://localhost:8003/scopes \
      -H "Content-Type: application/json" \
-     -d '{"scope_name": "joblogic-kb/s3-docs", "description": "S3 documents", "owner": "operator@example.com"}'
+     -d '{"scope_name": "joblogic-kb/gdrive-docs", "description": "Google Drive documents", "owner": "operator@example.com"}'
    ```
 
-2. Configure scope mapping for the S3 connector:
+6. Configure scope mapping for the Google Drive connector:
    ```bash
    export CONNECTOR_SCOPE_MAPPINGS='[
-     {"connector_module": "aws_s3", "source_pattern": "s3://my-bucket/*", "scope": "joblogic-kb/s3-docs"}
+     {"connector_module": "google_drive", "source_pattern": "gdrive://*", "scope": "joblogic-kb/gdrive-docs"}
    ]'
    ```
 
@@ -624,64 +653,103 @@ validation, dedup, versioning, and provenance rules apply unchanged.
 
 Credentials must come from managed secret storage — **never hardcode them**.
 
-Minimum required secret fields:
+Required config fields:
 
 | Field | Description |
 |---|---|
-| `access_key` | AWS Access Key ID (IAM user with `s3:GetObject`, `s3:ListBucket`) |
-| `secret_key` | AWS Secret Access Key |
-| `endpoint_url` | Optional; set for MinIO / Cloudflare R2 / custom S3-compatible endpoints |
-| `region` | Optional; default is `us-east-1` |
-| `bucket_names` | List of buckets to ingest from; empty list = auto-discover all accessible buckets |
-| `prefix` | Optional key prefix filter (e.g. `"docs/"`) |
+| `client_id` | OAuth2 client ID from Google Cloud Console |
+| `client_secret` | OAuth2 client secret |
+| `token_file` | Absolute path to the stored OAuth token JSON (contains refresh_token) |
+
+Optional config fields:
+
+| Field | Description |
+|---|---|
+| `folder_ids` | List of Google Drive folder IDs to sync. Empty = all of My Drive |
+| `file_ids` | Specific file IDs to sync. Takes precedence over `folder_ids` if set |
+| `scope` | Target knowledge scope (fallback when no scope mapping rule matches) |
+| `owner` | Actor identifier for audit log |
 
 **K8s Secret example:**
 ```yaml
 apiVersion: v1
 kind: Secret
 metadata:
-  name: s3-connector-creds
+  name: gdrive-connector-creds
 type: Opaque
 stringData:
-  access_key: "<AWS_ACCESS_KEY_ID>"
-  secret_key: "<AWS_SECRET_ACCESS_KEY>"
-  bucket_names: '["my-docs-bucket"]'
+  client_id: "<GOOGLE_CLIENT_ID>"
+  client_secret: "<GOOGLE_CLIENT_SECRET>"
 ```
+
+Mount the token file as a separate Secret or PVC volume so it can be refreshed and
+written back by the service without re-creating the Secret.
+
+### Token refresh write-back
+
+If the access token is expired, the connector refreshes it automatically using the
+stored refresh token. The refreshed token is **atomically persisted** to the token
+file before the sync proceeds. If persistence fails (disk full, permissions error),
+the sync is aborted with a `RuntimeError` — **fail closed**. Monitor for this error
+and ensure the token file path is writable by the service process.
+
+### OAuth scopes required
+
+```
+https://www.googleapis.com/auth/drive.readonly
+https://www.googleapis.com/auth/drive.metadata.readonly
+```
+
+### Supported file types
+
+| Google Drive type | Action | Format ingested |
+|---|---|---|
+| PDF | Direct download | `pdf` |
+| DOCX | Direct download | `docx` |
+| HTML | Direct download | `html` |
+| Markdown / plain text | Direct download | `markdown` / `txt` |
+| Google Docs | Export as DOCX | `docx` |
+| Google Sheets | Export as XLSX | `xlsx` |
+| Google Slides | Export as PPTX | `pptx` |
+
+All other MIME types are skipped (logged as DEBUG).
 
 ### Running a sync
 
 ```python
 import asyncio
-from connectors.aws_s3_wrapper import sync_s3_bucket
+from connectors.google_drive_wrapper import sync_gdrive
 
 config = {
-    "access_key": "<from secret store>",
-    "secret_key": "<from secret store>",
-    "bucket_names": ["my-docs-bucket"],
-    "prefix": "docs/",
-    "scope": "joblogic-kb/s3-docs",   # fallback if CONNECTOR_SCOPE_MAPPINGS not set
+    "client_id": "<from secret store>",
+    "client_secret": "<from secret store>",
+    "token_file": "/var/secrets/gdrive/token.json",
+    "folder_ids": ["1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms"],  # optional
+    "scope": "joblogic-kb/gdrive-docs",  # fallback if CONNECTOR_SCOPE_MAPPINGS not set
     "owner": "operator@example.com",
 }
 
-results = asyncio.run(sync_s3_bucket(config))
+results = asyncio.run(sync_gdrive(config))
 for r in results:
-    print(r.verdict, r.source_uri if hasattr(r, "source_uri") else "")
+    print(r.verdict, r.source_uri)
 ```
 
 ### Identity contract
 
 | Field | Value |
 |---|---|
-| `connector_module` | `"aws_s3"` |
-| `source_uri` | `s3://{bucket}/{key}` |
-| `source_revision` | `LastModified` ISO 8601 UTC string from boto3 |
-| Rename behaviour | Object rename = new `document_id` (new document, v1). Same semantics as manual upload rename. |
-| Unchanged detection | SHA-256 of raw bytes. Same object re-fetched with identical content → `skipped_unchanged`. |
+| `connector_module` | `"google_drive"` |
+| `source_uri` | `gdrive://{fileId}` — Google Drive stable file identifier |
+| `source_revision` | `modifiedTime` ISO 8601 UTC string from the Drive API |
+| Rename behaviour | File rename does **not** change `document_id` — the fileId is stable. The new filename appears on the next version row. |
+| Move behaviour | Moving a file between folders does **not** change `document_id` — fileId is stable. |
+| Unchanged detection | SHA-256 of raw bytes. Same file re-fetched with identical content → `skipped_unchanged`. |
+| Incremental sync | Not implemented (W-C2.2). Full pull only. Changes API integration is a future issue. |
 
-### Webhook support
+### Webhook / push notification support
 
-Not implemented in W-C2.1. The connector uses pull-based sync only. Run
-`sync_s3_bucket()` on a schedule or trigger it manually. S3 event notification
+Not implemented in W-C2.2. The connector uses pull-based sync only. Run
+`sync_gdrive()` on a schedule or trigger it manually. Google Drive push notification
 integration is a future issue.
 
 ---
