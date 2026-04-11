@@ -6,18 +6,16 @@ All upload calls are non-blocking: the caller receives a job_id immediately.
 Document processing runs in FastAPI BackgroundTasks (synchronous pipeline day-1).
 """
 
-import base64
 import hashlib
 import logging
 import re
-from typing import Any, Dict, Optional
+from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, field_validator
 
 from config import get_settings
-from connectors.adapter import ConnectorEvent, ingest_from_connector
 from db import registry
 from normalizer.base import detect_format
 from storage import store
@@ -267,119 +265,6 @@ async def rollback_document(document_id: str, body: RollbackRequest) -> dict:
         },
     )
     return result
-
-
-# ── Connector HTTP ingest (W-C3.1) ───────────────────────────────────────────
-
-_MAX_CONNECTOR_PAYLOAD_BYTES = 50 * 1024 * 1024  # 50 MiB
-_VALID_FORMATS = {"pdf", "docx", "html", "markdown", "txt"}
-
-
-class ConnectorIngestRequest(BaseModel):
-    """Request body for POST /connectors/ingest (W-C3.1).
-
-    raw_bytes_b64 must be standard base64-encoded (RFC 4648) content of the
-    source document. Maximum decoded size: 50 MiB. Invalid base64 returns 422.
-    """
-
-    connector_module: str
-    scope: str
-    source_uri: str
-    filename: str
-    format: str
-    raw_bytes_b64: str
-    source_revision: Optional[str] = None
-    owner: str = ""
-    metadata: Dict[str, Any] = {}
-
-    @field_validator("format")
-    @classmethod
-    def validate_format(cls, v: str) -> str:
-        if v not in _VALID_FORMATS:
-            raise ValueError(
-                f"format must be one of {sorted(_VALID_FORMATS)}. Got: '{v}'"
-            )
-        return v
-
-    @field_validator("connector_module", "scope", "source_uri", "filename")
-    @classmethod
-    def validate_nonempty(cls, v: str) -> str:
-        if not v or not v.strip():
-            raise ValueError("field must not be empty")
-        return v
-
-
-class ConnectorIngestResponse(BaseModel):
-    task_id: str
-    verdict: str
-    document_id: Optional[str] = None
-    job_id: Optional[str] = None
-    version: Optional[int] = None
-    error_message: Optional[str] = None
-
-
-@router.post("/connectors/ingest", status_code=200, response_model=ConnectorIngestResponse)
-async def connector_ingest(body: ConnectorIngestRequest) -> ConnectorIngestResponse:
-    """Accept a connector-sourced document and pass it to ingest_from_connector().
-
-    This is a thin HTTP transport wrapper over the W-C1 adapter.
-    All scope validation, dedup, versioning, and provenance rules are enforced
-    by ingest_from_connector() — this route adds nothing on top.
-
-    Returns 200 for all adapter verdicts, including fetch_failed.
-    Returns 422 for malformed requests or invalid base64.
-    Returns 413 if the decoded payload exceeds 50 MiB.
-
-    Auth: none — internal-network-only (same boundary as operator UI).
-    """
-    # Decode raw_bytes — 422 on invalid base64
-    try:
-        raw_bytes = base64.b64decode(body.raw_bytes_b64, validate=True)
-    except Exception:
-        raise HTTPException(status_code=422, detail="raw_bytes_b64 is not valid base64")
-
-    # Size check — 413 if payload exceeds limit
-    if len(raw_bytes) > _MAX_CONNECTOR_PAYLOAD_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=(
-                f"Decoded payload size {len(raw_bytes)} bytes exceeds the "
-                f"{_MAX_CONNECTOR_PAYLOAD_BYTES // (1024 * 1024)} MiB limit"
-            ),
-        )
-
-    event = ConnectorEvent(
-        connector_module=body.connector_module,
-        scope=body.scope,
-        source_uri=body.source_uri,
-        filename=body.filename,
-        format=body.format,
-        raw_bytes=raw_bytes,
-        source_revision=body.source_revision,
-        owner=body.owner,
-        metadata=body.metadata,
-    )
-
-    logger.debug(
-        "connector_ingest: connector_module=%s source_uri=%s filename=%r format=%s bytes=%d",
-        body.connector_module, body.source_uri, body.filename, body.format, len(raw_bytes),
-    )
-
-    result = ingest_from_connector(event)
-
-    logger.info(
-        "connector_ingest: verdict=%s task_id=%s source_uri=%s",
-        result.verdict, result.task_id, body.source_uri,
-    )
-
-    return ConnectorIngestResponse(
-        task_id=result.task_id,
-        verdict=result.verdict,
-        document_id=result.document_id,
-        job_id=result.job_id,
-        version=result.version,
-        error_message=result.error_message,
-    )
 
 
 # ── Operator UI ───────────────────────────────────────────────────────────────
