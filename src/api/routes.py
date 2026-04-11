@@ -478,6 +478,9 @@ _OPERATOR_UI_HTML = """<!DOCTYPE html>
           <input id="s3Scope" placeholder="joblogic-kb/s3-docs">
           <label>Bucket</label>
           <input id="s3Bucket" placeholder="my-docs-bucket">
+          <p style="font-size:0.78rem;color:#555;margin:-6px 0 8px">
+            Source URI format: <code>s3://{bucket}/{key}</code>
+          </p>
           <label>Secret Ref (leave blank for default AWS env vars)</label>
           <input id="s3SecretRef" placeholder="default">
         </div>

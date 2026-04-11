@@ -361,6 +361,11 @@ class TestOperatorUI:
         resp = client.get("/ui")
         assert "/connectors/s3/sync" in resp.text
 
+    def test_ui_shows_source_uri_format_hint(self):
+        """The S3 form must display a visible s3://{bucket}/{key} format hint."""
+        resp = client.get("/ui")
+        assert "s3://{bucket}/{key}" in resp.text
+
     def test_ui_does_not_expose_access_key_input(self):
         """The S3 form must not have an HTML input element for plaintext credentials.
 
