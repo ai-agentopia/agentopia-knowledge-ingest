@@ -10,6 +10,12 @@ psycopg[binary]>=3.1.0
 # Storage
 boto3>=1.34.0
 
+# Google Drive connector (W-C2.2, knowledge-ingest#38)
+google-auth>=2.28.0
+google-auth-oauthlib>=1.2.0
+google-api-python-client>=2.120.0
+requests>=2.31.0
+
 # Normalizers
 pdfplumber>=0.11.0
 python-docx>=1.1.0
