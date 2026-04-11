@@ -165,6 +165,37 @@ class _InMemoryRegistry:
                     r["error_message"] = error_message
                 break
 
+    def promote_to_active(self, row_id, document_id):
+        """Atomic swap: supersede prior active row, promote new row.
+
+        Mirrors the production constraint: only one active row per document_id.
+        Raises ValueError if the target row does not exist (simulates DB error).
+        """
+        # Check the unique constraint: no two active rows for the same document_id
+        active_rows = [r for r in self._rows if r["document_id"] == document_id and r["status"] == "active"]
+        superseded_row_id = None
+        for r in active_rows:
+            if r["row_id"] != row_id:
+                r["status"] = "superseded"
+                superseded_row_id = r["row_id"]
+
+        # Promote the new row
+        promoted = False
+        for r in self._rows:
+            if r["row_id"] == row_id:
+                r["status"] = "active"
+                promoted = True
+                break
+        if not promoted:
+            raise ValueError(f"Row {row_id} not found — cannot promote to active")
+
+        # Enforce uniqueness invariant (in-memory simulation of DB constraint)
+        active_after = [r for r in self._rows if r["document_id"] == document_id and r["status"] == "active"]
+        if len(active_after) > 1:
+            raise RuntimeError(f"Constraint violation: {len(active_after)} active rows for document_id={document_id}")
+
+        return superseded_row_id
+
     def patch_s3_original_key(self, row_id, key):
         for r in self._rows:
             if r["row_id"] == row_id:
@@ -751,6 +782,7 @@ class TestOrchestratorPipeline(unittest.TestCase):
 
         patches = [
             patch("db.registry.update_document_status", side_effect=reg.update_document_status),
+            patch("db.registry.promote_to_active", side_effect=reg.promote_to_active),
             patch("db.registry.update_job", side_effect=reg.update_job),
             patch("db.registry.write_audit_event", side_effect=reg.write_audit_event),
             patch("orchestrator.httpx.post", side_effect=_mock_post),
@@ -819,6 +851,60 @@ class TestOrchestratorPipeline(unittest.TestCase):
         active = self.reg.get_active_version(doc_id)
         self.assertIsNotNone(active)
         self.assertEqual(active["version"], 1)
+
+    def test_replacement_v1_superseded_v2_active_atomic(self):
+        """v1 active → v2 successful ingest → v1 superseded, v2 active.
+
+        This is the critical replacement path test. It verifies:
+        1. promote_to_active() is called (not plain update_document_status("active"))
+        2. v1 is superseded atomically before v2 becomes active
+        3. The unique-active constraint is never violated (at most one active per document_id)
+        4. The in-memory stub enforces the same constraint as the DB partial index
+
+        Test the orchestrator calls promote_to_active on the success path by checking
+        that after a second successful pipeline run on the same logical document:
+          - v1.status == "superseded"
+          - v2.status == "active"
+          - only one active row exists for the document_id
+        """
+        filename = "api-spec.md"
+        scope = "test/scope"
+        doc_id = stable_document_id(scope, filename)
+
+        # ── Ingest v1 ─────────────────────────────────────────────────────────
+        md_v1 = b"# API Spec v1\n\n## Auth\n\nUse bearer tokens."
+        v1_job_id, _ = self._run_pipeline(md_v1, filename, self.reg, super_rag_ok=True)
+
+        # After pipeline completes, v1 must be active
+        v1_row = next((r for r in self.reg._rows if r["document_id"] == doc_id and r["version"] == 1), None)
+        self.assertIsNotNone(v1_row, "v1 row must exist after first ingest")
+        self.assertEqual(v1_row["status"], "active",
+                         "v1 must be active after first successful ingest")
+
+        # Exactly one active row at this point
+        active_after_v1 = [r for r in self.reg._rows if r["document_id"] == doc_id and r["status"] == "active"]
+        self.assertEqual(len(active_after_v1), 1, "Must be exactly one active row after v1 ingest")
+
+        # ── Ingest v2 (replacement) ───────────────────────────────────────────
+        md_v2 = b"# API Spec v2\n\n## Auth\n\nOAuth2 tokens now required."
+        v2_job_id, _ = self._run_pipeline(md_v2, filename, self.reg, super_rag_ok=True)
+
+        # After second pipeline completes:
+        v1_row_after = next((r for r in self.reg._rows if r["document_id"] == doc_id and r["version"] == 1), None)
+        v2_row_after = next((r for r in self.reg._rows if r["document_id"] == doc_id and r["version"] == 2), None)
+
+        self.assertIsNotNone(v2_row_after, "v2 row must exist after second ingest")
+        self.assertEqual(v2_row_after["status"], "active",
+                         "v2 must be active after successful replacement")
+        self.assertEqual(v1_row_after["status"], "superseded",
+                         "v1 must be superseded after v2 promotion")
+
+        # Constraint: exactly one active row for this document_id
+        active_after_v2 = [r for r in self.reg._rows if r["document_id"] == doc_id and r["status"] == "active"]
+        self.assertEqual(len(active_after_v2), 1,
+                         "Unique-active constraint: must be exactly one active row after replacement")
+        self.assertEqual(active_after_v2[0]["version"], 2,
+                         "The active row must be v2, not v1")
 
     def test_audit_events_written_for_each_stage(self):
         md = b"# Audited\n\nContent."

@@ -192,6 +192,49 @@ def update_document_status(
         )
 
 
+def promote_to_active(row_id: int, document_id: str) -> int | None:
+    """Atomically promote a document version to active and supersede the prior active row.
+
+    Both operations happen in one transaction so the unique partial index
+    idx_documents_one_active (only one active per document_id) is never violated:
+      1. UPDATE prior active row   → status = 'superseded'
+      2. UPDATE new row (row_id)   → status = 'active'
+
+    Returns the row_id of the superseded row, or None if there was no prior active version
+    (first ingest of this logical document).
+
+    Raises on any DB error; the caller must handle the failure and mark the job failed.
+    """
+    with transaction() as cur:
+        # Step 1: supersede the current active version of this document (if any)
+        cur.execute(
+            """
+            UPDATE documents
+            SET    status = 'superseded', updated_at = NOW()
+            WHERE  document_id = %s
+              AND  status = 'active'
+              AND  row_id != %s
+            RETURNING row_id
+            """,
+            (document_id, row_id),
+        )
+        superseded = cur.fetchone()
+        superseded_row_id = superseded[0] if superseded else None
+
+        # Step 2: mark the new row active — only AFTER superseding the prior one
+        # so the unique partial index constraint is never violated mid-transaction
+        cur.execute(
+            """
+            UPDATE documents
+            SET    status = 'active', updated_at = NOW()
+            WHERE  row_id = %s
+            """,
+            (row_id,),
+        )
+
+    return superseded_row_id
+
+
 def patch_s3_original_key(row_id: int, s3_original_key: str) -> None:
     """Update s3_original_key after initial row creation."""
     with transaction() as cur:

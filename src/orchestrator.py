@@ -164,9 +164,14 @@ def run_pipeline(
         )
         return
 
-    # ── Stage 4: Mark active ──────────────────────────────────────────────────
+    # ── Stage 4: Promote to active (atomic swap with prior active version) ────
+    # promote_to_active() supersedes the prior active row and sets this row to
+    # active in a single transaction. This satisfies the unique partial index
+    # idx_documents_one_active (only one active per document_id at any time).
+    # Plain update_document_status(row_id, "active") is NOT used here because
+    # it would violate the constraint when a prior active version exists.
     try:
-        registry.update_document_status(row_id, "active")
+        superseded_row_id = registry.promote_to_active(row_id, document_id)
         registry.update_job(job_id, status="active", stage="active",
                             progress_percent=100, completed=True)
         registry.write_audit_event(
@@ -177,16 +182,16 @@ def run_pipeline(
             scope=scope,
             actor=actor,
             status="success",
-            metadata={"format": fmt},
+            metadata={"format": fmt, "superseded_row_id": superseded_row_id},
         )
         logger.info(
-            "orchestrator: doc=%s v%d active scope=%s",
-            document_id, version, scope,
+            "orchestrator: doc=%s v%d active scope=%s superseded_row=%s",
+            document_id, version, scope, superseded_row_id,
         )
     except Exception as exc:
-        logger.error("orchestrator: failed to mark active doc=%s v%d: %s", document_id, version, exc)
+        logger.error("orchestrator: failed to promote active doc=%s v%d: %s", document_id, version, exc)
         _fail(job_id, row_id, document_id, version, scope,
-              f"Failed to mark active: {exc}", actor=actor)
+              f"Failed to promote to active: {exc}", actor=actor)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
