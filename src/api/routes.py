@@ -406,15 +406,32 @@ _OPERATOR_UI_HTML = """<!DOCTYPE html>
   <div class="section">
     <h2 id="hQual" onclick="toggle('sQual','hQual')">&#x1F4CA; Quality Dashboard</h2>
     <div id="sQual" class="section-body">
-      <div style="margin-bottom:10px">
+      <p style="font-size:0.82rem;color:#555;margin-top:0">
+        Reads from Super RAG. Enter the Super RAG URL and token below (shared with Retrieval Debugger).
+        Auth or backend failures are shown as explicit errors, not empty data.
+      </p>
+
+      <!-- Baselines -->
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
         <button onclick="loadBaselines()">Load All Baselines</button>
-        <span id="baselineScope" style="margin-left:12px">
-          <input id="bsScope" placeholder="scope for results" style="width:220px;display:inline;margin-bottom:0">
-          <button onclick="loadResults()" class="secondary">Load Results</button>
-        </span>
+        <span id="baselineErr" style="color:#842029;font-size:0.82rem;display:none"></span>
       </div>
       <div id="baselineTable"></div>
-      <div id="resultsTable" style="margin-top:16px"></div>
+
+      <!-- Regression history for one scope -->
+      <div style="margin-top:20px;border-top:1px solid #e0e0e0;padding-top:14px">
+        <div style="display:flex;gap:8px;align-items:flex-end;margin-bottom:8px">
+          <div style="flex:1">
+            <label>Scope — regression history</label>
+            <input id="bsScope" placeholder="joblogic-kb/api-docs">
+          </div>
+          <button onclick="loadResults()" class="secondary">Load History</button>
+          <span id="resultsErr" style="color:#842029;font-size:0.82rem;display:none"></span>
+        </div>
+        <!-- Trend summary: latest nDCG, delta, blocked count -->
+        <div id="trendSummary" style="display:none;margin-bottom:10px;padding:10px;background:#f8f9fa;border-radius:6px;font-size:0.82rem"></div>
+        <div id="resultsTable"></div>
+      </div>
     </div>
   </div>
 
@@ -631,18 +648,43 @@ _OPERATOR_UI_HTML = """<!DOCTYPE html>
   }
 
   // ── Quality Dashboard ──────────────────────────────────────────────────────
+  // Finding 1 fix: both functions check resp.ok and surface auth/backend errors
+  // explicitly to the operator instead of silently showing empty data.
+
+  function superRagConn() {
+    return {
+      url: (document.getElementById('dbgUrl').value || '').trim() || 'http://localhost:8002',
+      token: (document.getElementById('dbgToken').value || '').trim(),
+    };
+  }
+
+  async function superRagFetch(path) {
+    const { url, token } = superRagConn();
+    if (!token) throw new Error('Super RAG Internal Token is required. Enter it in the Retrieval Debugger section.');
+    const resp = await fetch(url + path, { headers: { 'X-Internal-Token': token } });
+    if (!resp.ok) {
+      let detail = resp.statusText;
+      try { const body = await resp.json(); detail = body.detail || detail; } catch {}
+      throw new Error('HTTP ' + resp.status + ' from Super RAG: ' + detail);
+    }
+    return resp.json();
+  }
 
   async function loadBaselines() {
     const el = document.getElementById('baselineTable');
-    const superRagUrl = document.getElementById('dbgUrl').value.trim() || 'http://localhost:8002';
-    const token = document.getElementById('dbgToken').value;
+    const errEl = document.getElementById('baselineErr');
+    errEl.style.display = 'none';
+    el.innerHTML = '<em>Loading…</em>';
     try {
-      const resp = await fetch(superRagUrl + '/api/v1/evaluation/baselines',
-        { headers: { 'X-Internal-Token': token } });
-      const d = await resp.json();
+      const d = await superRagFetch('/api/v1/evaluation/baselines');
       const bs = d.baselines || [];
-      if (!bs.length) { el.innerHTML = '<em>No baselines established yet. Use POST /evaluation/baselines/{scope} in Super RAG.</em>'; return; }
-      el.innerHTML = '<table><thead><tr><th>Scope</th><th>nDCG@5</th><th>MRR</th><th>P@5</th><th>R@5</th><th>Questions</th><th>Established</th></tr></thead><tbody>' +
+      if (!bs.length) {
+        el.innerHTML = '<em>No baselines established yet. ' +
+          'Run <code>POST /api/v1/evaluation/baselines/{scope}</code> in Super RAG to create one.</em>';
+        return;
+      }
+      el.innerHTML = '<table data-testid="baseline-table"><thead><tr>' +
+        '<th>Scope</th><th>nDCG@5</th><th>MRR</th><th>P@5</th><th>R@5</th><th>Questions</th><th>Established</th></tr></thead><tbody>' +
         bs.map(b => `<tr>
           <td style="font-family:monospace;font-size:0.78rem">${b.scope}</td>
           <td>${(b.ndcg_5||0).toFixed(4)}</td>
@@ -652,39 +694,84 @@ _OPERATOR_UI_HTML = """<!DOCTYPE html>
           <td>${b.golden_question_count}</td>
           <td>${isoDate(b.established_at)}</td>
         </tr>`).join('') + '</tbody></table>';
-    } catch (e) { el.innerHTML = '<em>Error loading baselines: ' + e.message + '</em>'; }
+    } catch (e) {
+      el.innerHTML = '';
+      errEl.textContent = 'Error: ' + e.message;
+      errEl.style.display = 'inline';
+    }
   }
 
   async function loadResults() {
-    const scope = document.getElementById('bsScope').value.trim();
+    const scope = (document.getElementById('bsScope').value || '').trim();
     const el = document.getElementById('resultsTable');
-    const superRagUrl = document.getElementById('dbgUrl').value.trim() || 'http://localhost:8002';
-    const token = document.getElementById('dbgToken').value;
-    if (!scope) { el.innerHTML = '<em>Enter scope above.</em>'; return; }
+    const summaryEl = document.getElementById('trendSummary');
+    const errEl = document.getElementById('resultsErr');
+    errEl.style.display = 'none';
+    summaryEl.style.display = 'none';
+    if (!scope) { el.innerHTML = '<em>Enter a scope name.</em>'; return; }
+    el.innerHTML = '<em>Loading…</em>';
     try {
-      const resp = await fetch(
-        superRagUrl + '/api/v1/evaluation/results?scope=' + encodeURIComponent(scope),
-        { headers: { 'X-Internal-Token': token } }
-      );
-      const d = await resp.json();
+      const d = await superRagFetch('/api/v1/evaluation/results?scope=' + encodeURIComponent(scope));
       const rs = d.results || [];
-      if (!rs.length) { el.innerHTML = '<em>No evaluation results for this scope.</em>'; return; }
-      el.innerHTML = '<h3 style="font-size:0.9rem;margin:0 0 6px">Recent Evaluation Results — ' + scope + '</h3>' +
-        '<table><thead><tr><th>Run At</th><th>Trigger</th><th>nDCG@5</th><th>Delta</th><th>Verdict</th><th>Override</th></tr></thead><tbody>' +
+      if (!rs.length) {
+        el.innerHTML = '<em>No evaluation results for scope <strong>' + scope + '</strong>.<br>' +
+          'Results are created automatically on document replacement once a baseline and golden questions exist.</em>';
+        return;
+      }
+
+      // ── Trend summary (Finding 2) ──────────────────────────────────────────
+      // Compute: latest nDCG, min/max delta, blocked count, trend direction
+      const withNdcg = rs.filter(r => r.ndcg_5 != null);
+      const latest = withNdcg[0];
+      const blockedCount = rs.filter(r => r.verdict === 'blocked').length;
+      const overrideCount = rs.filter(r => r.operator_override).length;
+      const deltas = rs.filter(r => r.delta_ndcg_5 != null).map(r => r.delta_ndcg_5);
+      const minDelta = deltas.length ? Math.min(...deltas) : null;
+      const maxDelta = deltas.length ? Math.max(...deltas) : null;
+
+      // Trend: compare first and last nDCG with data
+      let trendText = '';
+      if (withNdcg.length >= 2) {
+        const oldest = withNdcg[withNdcg.length - 1];
+        const trendDelta = latest.ndcg_5 - oldest.ndcg_5;
+        const arrow = trendDelta >= 0.005 ? '↑' : trendDelta <= -0.005 ? '↓' : '→';
+        trendText = `Trend vs oldest (${withNdcg.length} runs): ${arrow} ${trendDelta >= 0 ? '+' : ''}${trendDelta.toFixed(4)}`;
+      }
+
+      summaryEl.innerHTML =
+        '<strong>Scope:</strong> ' + scope + ' &nbsp;|&nbsp; ' +
+        '<strong>Runs:</strong> ' + rs.length + ' &nbsp;|&nbsp; ' +
+        (latest ? '<strong>Latest nDCG@5:</strong> ' + latest.ndcg_5.toFixed(4) + ' &nbsp;|&nbsp; ' : '') +
+        (minDelta != null ? '<strong>Delta range:</strong> ' + (minDelta >= 0 ? '+' : '') + minDelta.toFixed(4) +
+          ' to ' + (maxDelta >= 0 ? '+' : '') + maxDelta.toFixed(4) + ' &nbsp;|&nbsp; ' : '') +
+        '<strong style="color:' + (blockedCount > 0 ? '#721c24' : '#155724') + '">Blocked:</strong> ' + blockedCount +
+        (overrideCount > 0 ? ' <span style="color:#155724">(' + overrideCount + ' overridden)</span>' : '') +
+        (trendText ? ' &nbsp;|&nbsp; ' + trendText : '');
+      summaryEl.style.display = 'block';
+
+      // ── Full results table ─────────────────────────────────────────────────
+      el.innerHTML = '<table data-testid="results-table"><thead><tr>' +
+        '<th>Run At</th><th>Trigger</th><th>nDCG@5</th><th>MRR</th><th>Delta</th><th>Verdict</th><th>Override</th>' +
+        '</tr></thead><tbody>' +
         rs.map(r => {
           const vc = r.verdict === 'passed' ? 'passed' : r.verdict === 'blocked' || r.verdict === 'eval_error' ? 'blocked' : 'warning';
           const delta = r.delta_ndcg_5 != null ? (r.delta_ndcg_5 >= 0 ? '+' : '') + r.delta_ndcg_5.toFixed(4) : '-';
-          const override = r.operator_override ? '✓ ' + (r.operator_identity || '') : '-';
+          const override = r.operator_override ? '✓ ' + (r.operator_identity || '(no id)') : '-';
           return `<tr>
             <td>${isoDate(r.run_at)}</td>
             <td>${r.trigger}</td>
             <td>${r.ndcg_5 != null ? r.ndcg_5.toFixed(4) : '-'}</td>
+            <td>${r.mrr != null ? r.mrr.toFixed(4) : '-'}</td>
             <td>${delta}</td>
             <td><span class="verdict ${vc}">${r.verdict}</span></td>
             <td style="font-size:0.78rem">${override}</td>
           </tr>`;
         }).join('') + '</tbody></table>';
-    } catch (e) { el.innerHTML = '<em>Error: ' + e.message + '</em>'; }
+    } catch (e) {
+      el.innerHTML = '';
+      errEl.textContent = 'Error: ' + e.message;
+      errEl.style.display = 'inline';
+    }
   }
 
   // ── Retrieval Debugger ─────────────────────────────────────────────────────
