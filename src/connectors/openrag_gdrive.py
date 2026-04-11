@@ -80,18 +80,14 @@ logger = logging.getLogger(__name__)
 _REFRESH_TIMEOUT_SECONDS = 30
 
 # Google Workspace MIME → (export MIME, file extension)
+# Only Google Docs is supported: exports to DOCX, which the ingest core can normalise.
+# Google Sheets (→ xlsx) and Google Slides (→ pptx) are NOT listed here because
+# the ingest core does not support those formats. Files with those MIME types will
+# be discovered by list_files() but skipped by the wrapper before ingest_from_connector().
 _EXPORT_FORMATS: Dict[str, tuple] = {
     "application/vnd.google-apps.document": (
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "docx",
-    ),
-    "application/vnd.google-apps.spreadsheet": (
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "xlsx",
-    ),
-    "application/vnd.google-apps.presentation": (
-        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        "pptx",
     ),
 }
 

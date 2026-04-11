@@ -24,6 +24,9 @@ Tests cover:
  13.  Multiple files → one SyncResult per attempted file
  14.  Empty file_ids config → falls through to list_all
  15.  fetch_failed from adapter propagated without raising
+ 16.  Google Sheets → skipped, never passed to ingest_from_connector()
+ 17.  Google Slides → skipped, never passed to ingest_from_connector()
+ 18.  xlsx/pptx not in wrapper's ingest format map
 """
 
 import inspect
@@ -543,6 +546,89 @@ class TestUnsupportedFormat:
         assert _infer_format("application/zip") is None
         assert _infer_format("image/png") is None
         assert _infer_format("video/mp4") is None
+
+
+# ---------------------------------------------------------------------------
+# 16-18. Google Sheets and Slides skipped; xlsx/pptx not in format map
+# ---------------------------------------------------------------------------
+
+class TestSheetsAndSlidesSkipped:
+    """Google Sheets and Google Slides must be skipped — the ingest core does not
+    support xlsx or pptx. These files must never reach ingest_from_connector()."""
+
+    _SHEETS_MIME = "application/vnd.google-apps.spreadsheet"
+    _SLIDES_MIME = "application/vnd.google-apps.presentation"
+    _EXPORTED_XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    _EXPORTED_PPTX = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+
+    @pytest.mark.asyncio
+    async def test_google_sheets_not_ingested(self):
+        """A Google Sheets file must be skipped — no ingest_from_connector() call."""
+        sheets_meta = _make_file_meta(mime_type=self._SHEETS_MIME)
+        connector = _connector_mock(files=[sheets_meta])
+
+        with patch(f"{_MOD}.GoogleDriveConnector", return_value=connector):
+            with patch(f"{_MOD}.ingest_from_connector") as mock_ingest:
+                results = await sync_gdrive(_BASE_CONFIG)
+
+        mock_ingest.assert_not_called()
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_google_slides_not_ingested(self):
+        """A Google Slides file must be skipped — no ingest_from_connector() call."""
+        slides_meta = _make_file_meta(mime_type=self._SLIDES_MIME)
+        connector = _connector_mock(files=[slides_meta])
+
+        with patch(f"{_MOD}.GoogleDriveConnector", return_value=connector):
+            with patch(f"{_MOD}.ingest_from_connector") as mock_ingest:
+                results = await sync_gdrive(_BASE_CONFIG)
+
+        mock_ingest.assert_not_called()
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_sheets_and_slides_skipped_pdf_ingested(self):
+        """Mixed list: Sheets and Slides are skipped; PDF proceeds to ingest."""
+        files = [
+            _make_file_meta(file_id=_FILE_ID_1, mime_type="application/pdf", name="doc.pdf"),
+            _make_file_meta(file_id=_FILE_ID_2, mime_type=self._SHEETS_MIME, name="budget.gsheet"),
+        ]
+        pdf_doc = _make_doc(file_id=_FILE_ID_1, mimetype="application/pdf")
+        connector = _connector_mock(files=files, doc=pdf_doc)
+
+        with patch(f"{_MOD}.GoogleDriveConnector", return_value=connector):
+            with patch(f"{_MOD}.ingest_from_connector", return_value=_ok_sync_result()) as mock_ingest:
+                results = await sync_gdrive(_BASE_CONFIG)
+
+        # Only the PDF was ingested
+        assert mock_ingest.call_count == 1
+        assert len(results) == 1
+        assert results[0].source_uri == f"gdrive://{_FILE_ID_1}"
+
+    def test_xlsx_not_in_infer_format(self):
+        """xlsx MIME type must not map to any ingest format — not supported by normalizer."""
+        assert _infer_format(self._EXPORTED_XLSX) is None
+
+    def test_pptx_not_in_infer_format(self):
+        """pptx MIME type must not map to any ingest format — not supported by normalizer."""
+        assert _infer_format(self._EXPORTED_PPTX) is None
+
+    def test_google_sheets_gdrive_mime_not_in_infer_format(self):
+        """google-apps.spreadsheet MIME must not produce an ingest format."""
+        assert _infer_format(self._SHEETS_MIME) is None
+
+    def test_google_slides_gdrive_mime_not_in_infer_format(self):
+        """google-apps.presentation MIME must not produce an ingest format."""
+        assert _infer_format(self._SLIDES_MIME) is None
+
+    def test_google_docs_still_supported(self):
+        """Google Docs (→ DOCX) must still be ingested — it is the only supported export."""
+        from connectors.openrag_gdrive import _EXPORT_FORMATS
+        assert "application/vnd.google-apps.document" in _EXPORT_FORMATS
+        # Sheets and Slides must NOT be in _EXPORT_FORMATS
+        assert "application/vnd.google-apps.spreadsheet" not in _EXPORT_FORMATS
+        assert "application/vnd.google-apps.presentation" not in _EXPORT_FORMATS
 
 
 # ---------------------------------------------------------------------------

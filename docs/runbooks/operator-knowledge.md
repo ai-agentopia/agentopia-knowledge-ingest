@@ -682,16 +682,29 @@ stringData:
   client_secret: "<GOOGLE_CLIENT_SECRET>"
 ```
 
-Mount the token file as a separate Secret or PVC volume so it can be refreshed and
-written back by the service without re-creating the Secret.
-
 ### Token refresh write-back
 
-If the access token is expired, the connector refreshes it automatically using the
-stored refresh token. The refreshed token is **atomically persisted** to the token
-file before the sync proceeds. If persistence fails (disk full, permissions error),
-the sync is aborted with a `RuntimeError` — **fail closed**. Monitor for this error
-and ensure the token file path is writable by the service process.
+When the stored access token is expired, the connector refreshes it automatically
+using the `refresh_token` and immediately writes the new token back to `token_file`
+before the sync proceeds. If the write fails, the sync is aborted with a
+`RuntimeError` — **fail closed**.
+
+**What this requires operationally:**
+
+- `token_file` must be on a **writable filesystem path** at runtime (for example
+  a PVC, a `hostPath` volume, or a writable `emptyDir`).
+- **K8s Secrets mounted as read-only volumes** (the default) will cause every
+  token refresh to fail with a `RuntimeError`. Do not mount the token file from a
+  K8s Secret volume unless the Secret is explicitly mounted as writable and the
+  Kubernetes version/driver supports it.
+- **Vault write-back is not implemented.** If your token comes from Vault, copy it
+  to a writable volume before the service starts and point `token_file` at that path.
+
+**Recommended setup:**
+
+Mount a PVC at `/var/secrets/gdrive/` and place the initial `token.json` there.
+The service can refresh and rewrite the token file freely. Back up the PVC if you
+need durability across PVC deletion.
 
 ### OAuth scopes required
 
@@ -709,10 +722,14 @@ https://www.googleapis.com/auth/drive.metadata.readonly
 | HTML | Direct download | `html` |
 | Markdown / plain text | Direct download | `markdown` / `txt` |
 | Google Docs | Export as DOCX | `docx` |
-| Google Sheets | Export as XLSX | `xlsx` |
-| Google Slides | Export as PPTX | `pptx` |
+| Google Sheets | **Skipped** | — (xlsx not supported by normalizer) |
+| Google Slides | **Skipped** | — (pptx not supported by normalizer) |
 
-All other MIME types are skipped (logged as DEBUG).
+All other MIME types are also skipped (logged as DEBUG).
+
+> **Note:** Google Sheets and Google Slides would export to xlsx and pptx respectively,
+> but the ingest normalizer does not support those formats. They are skipped before any
+> content download is attempted. Support for xlsx/pptx is a future issue.
 
 ### Running a sync
 

@@ -78,15 +78,24 @@ logger = logging.getLogger(__name__)
 
 CONNECTOR_MODULE = "google_drive"
 
-# MIME types natively supported by knowledge-ingest (after export for Workspace docs)
+# MIME type produced by Google Docs export (DOCX) — the only exported Workspace format
+# that the ingest core can normalise.
+# Google Sheets (→ xlsx) and Google Slides (→ pptx) are intentionally excluded:
+# the ingest normalizer does not support those formats and they would fail in the
+# normalization stage. Files with those MIME types are skipped before ingest_from_connector().
 _EXPORTED_MIME_TO_FORMAT: Dict[str, str] = {
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
-    "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
 }
 
-# Combined format map: direct download formats + exported Workspace formats
+# Combined format map: direct download formats + Google Docs export format
 _MIME_TO_FORMAT: Dict[str, str] = {**_DIRECT_MIME_TYPES, **_EXPORTED_MIME_TO_FORMAT}
+
+# Google Workspace MIME types that export to formats unsupported by the ingest core.
+# These are pre-filtered from file metadata before any content download is attempted.
+_UNSUPPORTED_WORKSPACE_MIMES: frozenset = frozenset({
+    "application/vnd.google-apps.spreadsheet",   # would export to xlsx — not supported
+    "application/vnd.google-apps.presentation",  # would export to pptx — not supported
+})
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +202,18 @@ async def sync_gdrive(config: Dict[str, Any]) -> List[SyncResult]:
             logger.warning(
                 "gdrive_wrapper: skipping file_id=%r — cannot derive source_uri: %s",
                 file_id, exc,
+            )
+            continue
+
+        # Pre-filter: skip Workspace types that export to formats the ingest core
+        # does not support (Google Sheets → xlsx, Google Slides → pptx).
+        # Skip here, before any content download, to avoid unnecessary API calls.
+        file_mime: str = file_meta.get("mimeType", "")
+        if file_mime in _UNSUPPORTED_WORKSPACE_MIMES:
+            logger.debug(
+                "gdrive_wrapper: skipping source_uri=%s — Workspace type %r exports "
+                "to a format not supported by the ingest normalizer",
+                source_uri, file_mime,
             )
             continue
 
