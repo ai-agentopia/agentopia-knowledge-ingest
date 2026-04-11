@@ -774,7 +774,70 @@ integration is a future issue.
 
 ---
 
-## 15. Google Drive Browser Picker (W-C3.4)
+## 15. Generic Browser-File Connector Trigger (W-C3.2)
+
+**Issue:** knowledge-ingest#46.
+
+Adds a **Generic Connector Ingest** section to the operator console at `GET /ui`.
+Use this when you have a document file on disk and want to submit it to any connector
+module via `POST /connectors/ingest` — without writing a script or using curl.
+
+The form is connector-agnostic: `connector_module` is a free-text field so any module
+name can be used (`aws_s3`, `openrag`, `custom_connector`, etc.).
+
+### When to use this form vs other paths
+
+| Situation | Use |
+|---|---|
+| File is on the operator's local disk, any connector module | **This form (W-C3.2)** |
+| File is in Google Drive, browser-side selection | Google Drive Picker section (W-C3.4) |
+| Files are in an S3 bucket, server should pull | AWS S3 Sync section (W-C3.5) |
+| Server-side Google Drive pull (scheduled/scripted) | `sync_gdrive(config)` — server-side wrapper (W-C2.2) |
+| Server-side S3 pull (scripted) | `sync_s3_bucket(config)` — server-side wrapper (W-C2.1) |
+
+### How the browser flow works
+
+1. Navigate to `GET /ui` → expand the **Generic Connector Ingest** section.
+2. Fill in:
+   - `connector_module` — the connector identifier (e.g. `aws_s3`)
+   - `scope` — target knowledge scope (must be registered via `POST /scopes`)
+   - `source_uri` — stable logical locator for this document (e.g. `s3://bucket/path.pdf`)
+   - `format` — select from the dropdown: `pdf`, `docx`, `html`, `markdown`, `txt`
+   - `source_revision` (optional) — external revision stamp (ETag, ISO 8601 timestamp, etc.)
+   - `owner` (optional) — actor identifier for audit log
+3. Click the **File** input and select a local file. The browser reads the file and:
+   - Auto-populates the `filename` field from the selected file name.
+   - Encodes the file bytes to base64 (`FileReader.readAsDataURL`, prefix stripped).
+4. Click **Submit to /connectors/ingest**. The browser POSTs JSON with `raw_bytes_b64`.
+5. The `SyncResult` verdict is displayed with colour:
+   - `fetched_new` (green) — new document version ingested
+   - `fetched_updated` (blue) — existing document updated
+   - `skipped_unchanged` (grey) — content unchanged (dedup match)
+   - `fetch_failed` (red) — adapter-level failure (see `error_message`)
+6. HTTP errors 413 (file > 50 MiB) and 422 (validation failure) display the detail text.
+
+### Identity contract
+
+The operator supplies all identity fields manually. There is no auto-derivation:
+
+| Field | Operator responsibility |
+|---|---|
+| `connector_module` | Must match the connector identifier expected by scope mappings |
+| `source_uri` | Must be the stable logical locator — no commit SHAs, no volatile query strings |
+| `source_revision` | Optional; pass the external revision stamp if available |
+| `filename` | Auto-populated from file selection; can be edited before submit |
+| `format` | Select from dropdown; must match the file content |
+
+### What this form does NOT do
+
+- No connector-specific auth, picker SDK, or OAuth flow.
+- No server-side pull — bytes come from the operator's local machine.
+- No async polling — the verdict is returned synchronously in the `POST /connectors/ingest` response.
+- No direct DB writes — all adapter invariants (scope validation, dedup, provenance) are enforced server-side.
+
+---
+
+## 16. Google Drive Browser Picker (W-C3.4)
 
 **Issue:** knowledge-ingest#48.
 

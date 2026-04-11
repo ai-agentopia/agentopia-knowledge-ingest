@@ -513,6 +513,52 @@ _OPERATOR_UI_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- ── Generic Connector Trigger (W-C3.2) ───────────────────────────── -->
+  <div class="section">
+    <h2 id="hConn" onclick="toggle('sConn','hConn')">&#x1F50C; Generic Connector Ingest</h2>
+    <div id="sConn" class="section-body">
+      <p style="font-size:0.82rem;color:#555;margin-top:0">
+        Submit any local file to <code>POST /connectors/ingest</code> as base64-encoded bytes.
+        Use this form for connector modules whose bytes are available on disk — the browser
+        encodes the file and submits directly. For Google Drive files use the picker below.
+        For S3 use the AWS S3 Sync section above.
+      </p>
+      <div class="row">
+        <div>
+          <label>connector_module</label>
+          <input id="connModule" placeholder="aws_s3, openrag, custom_connector …">
+          <label>Scope (tenant/domain)</label>
+          <input id="connScope" placeholder="joblogic-kb/api-docs">
+          <label>source_uri</label>
+          <input id="connSourceUri" placeholder="s3://bucket/path.pdf">
+          <label>Format</label>
+          <select id="connFormat">
+            <option value="pdf">pdf</option>
+            <option value="docx">docx</option>
+            <option value="html">html</option>
+            <option value="markdown">markdown</option>
+            <option value="txt">txt</option>
+          </select>
+        </div>
+        <div>
+          <label>File</label>
+          <input type="file" id="connFile" accept=".pdf,.docx,.html,.htm,.md,.markdown,.txt"
+                 onchange="connOnFileChange(this)">
+          <label>filename (auto-populated)</label>
+          <input id="connFilename" placeholder="api-reference.pdf">
+          <label>source_revision (optional)</label>
+          <input id="connRevision" placeholder="2024-01-15T10:30:45Z">
+          <label>Owner (optional)</label>
+          <input id="connOwner" placeholder="operator@example.com">
+        </div>
+      </div>
+      <div class="actions">
+        <button onclick="doConnIngest()">Submit to /connectors/ingest</button>
+      </div>
+      <div id="connOut" class="output" style="margin-top:8px">Ready.</div>
+    </div>
+  </div>
+
   <!-- ── Google Drive Picker (W-C3.4) ──────────────────────────────────── -->
   <div class="section">
     <h2 id="hGDrive" onclick="toggle('sGDrive','hGDrive')">&#x1F4C1; Google Drive Ingest</h2>
@@ -1150,6 +1196,96 @@ _OPERATOR_UI_HTML = """<!DOCTYPE html>
     };
     if (owner) payload.owner = owner;
 
+    try {
+      const resp = await fetch('/connectors/ingest', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await resp.json();
+      if (resp.status === 413) {
+        outEl.textContent = 'Error 413: File too large (limit 50 MiB). ' + (data.detail || '');
+        return;
+      }
+      if (resp.status === 422) {
+        outEl.textContent = 'Error 422: ' + (data.detail || JSON.stringify(data));
+        return;
+      }
+      if (!resp.ok) {
+        outEl.textContent = 'Error ' + resp.status + ': ' + (data.detail || resp.statusText);
+        return;
+      }
+      const verdictColor = { fetched_new: '#155724', fetched_updated: '#004085', skipped_unchanged: '#383d41', fetch_failed: '#721c24' };
+      const color = verdictColor[data.verdict] || '#383d41';
+      outEl.innerHTML = `<span style="color:${color};font-weight:600">${data.verdict}</span>` +
+        `\\ntask_id: ${data.task_id || '-'}` +
+        (data.document_id ? `\\ndocument_id: ${data.document_id}` : '') +
+        (data.version     ? `  v${data.version}` : '') +
+        (data.job_id      ? `\\njob_id: ${data.job_id}` : '') +
+        (data.error_message ? `\\nerror: ${data.error_message}` : '');
+    } catch (e) { outEl.textContent = 'Network error: ' + e.message; }
+  }
+
+  // ── Generic Connector Trigger (W-C3.2) ────────────────────────────────────
+  // Browser file → base64 → POST /connectors/ingest.
+  // Connector-agnostic: no picker SDK, no OAuth, no server-side pull.
+
+  // Stores the base64 payload after FileReader completes.
+  let _connRawB64 = null;
+
+  function connOnFileChange(input) {
+    const outEl = document.getElementById('connOut');
+    _connRawB64 = null;
+    if (!input.files || !input.files[0]) return;
+    const file = input.files[0];
+    // Auto-populate filename from the selected file.
+    document.getElementById('connFilename').value = file.name;
+    outEl.textContent = 'Reading file…';
+    const reader = new FileReader();
+    reader.onload = function(e) {
+      // readAsDataURL produces "data:<mime>;base64,<b64>" — strip the prefix.
+      const dataUrl = e.target.result;
+      const commaIdx = dataUrl.indexOf(',');
+      _connRawB64 = commaIdx >= 0 ? dataUrl.slice(commaIdx + 1) : dataUrl;
+      outEl.textContent = `File read: ${file.name} (${file.size} bytes). Ready to submit.`;
+    };
+    reader.onerror = function() {
+      outEl.textContent = 'Error reading file.';
+    };
+    reader.readAsDataURL(file);
+  }
+
+  async function doConnIngest() {
+    const outEl = document.getElementById('connOut');
+    const connModule  = document.getElementById('connModule').value.trim();
+    const scope       = document.getElementById('connScope').value.trim();
+    const sourceUri   = document.getElementById('connSourceUri').value.trim();
+    const filename    = document.getElementById('connFilename').value.trim();
+    const format      = document.getElementById('connFormat').value;
+    const revision    = document.getElementById('connRevision').value.trim();
+    const owner       = document.getElementById('connOwner').value.trim();
+
+    if (!connModule) { outEl.textContent = 'connector_module is required.'; return; }
+    if (!scope)      { outEl.textContent = 'Scope is required.'; return; }
+    if (!sourceUri)  { outEl.textContent = 'source_uri is required.'; return; }
+    if (!filename)   { outEl.textContent = 'filename is required.'; return; }
+    if (!_connRawB64) {
+      outEl.textContent = 'No file selected or file not yet read. Select a file first.';
+      return;
+    }
+
+    const payload = {
+      connector_module: connModule,
+      scope,
+      source_uri: sourceUri,
+      filename,
+      format,
+      raw_bytes_b64: _connRawB64,
+    };
+    if (revision) payload.source_revision = revision;
+    if (owner)    payload.owner = owner;
+
+    outEl.textContent = 'Submitting to /connectors/ingest…';
     try {
       const resp = await fetch('/connectors/ingest', {
         method: 'POST',
