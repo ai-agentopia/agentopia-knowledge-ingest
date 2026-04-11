@@ -343,6 +343,98 @@ as the last rule to ensure every document lands somewhere.
 
 ---
 
+## 12. Configure and Run the AWS S3 Connector (W-C2.1)
+
+The AWS S3 connector pulls documents from S3-compatible object storage into a
+knowledge scope. It uses the `ingest_from_connector()` adapter (W-C1) — all scope
+validation, dedup, versioning, and provenance rules apply unchanged.
+
+**Source:** `langflow-ai/openrag` `src/connectors/aws_s3/connector.py` (adapted).
+**Implementation:** `src/connectors/openrag_s3.py`, `src/connectors/aws_s3_wrapper.py`.
+**Issue:** knowledge-ingest#37.
+
+### Prerequisites
+
+1. Create the target scope (if not already done):
+   ```bash
+   curl -X POST http://localhost:8003/scopes \
+     -H "Content-Type: application/json" \
+     -d '{"scope_name": "joblogic-kb/s3-docs", "description": "S3 documents", "owner": "operator@example.com"}'
+   ```
+
+2. Configure scope mapping for the S3 connector:
+   ```bash
+   export CONNECTOR_SCOPE_MAPPINGS='[
+     {"connector_module": "aws_s3", "source_pattern": "s3://my-bucket/*", "scope": "joblogic-kb/s3-docs"}
+   ]'
+   ```
+
+### Secret handling requirements
+
+Credentials must come from managed secret storage — **never hardcode them**.
+
+Minimum required secret fields:
+
+| Field | Description |
+|---|---|
+| `access_key` | AWS Access Key ID (IAM user with `s3:GetObject`, `s3:ListBucket`) |
+| `secret_key` | AWS Secret Access Key |
+| `endpoint_url` | Optional; set for MinIO / Cloudflare R2 / custom S3-compatible endpoints |
+| `region` | Optional; default is `us-east-1` |
+| `bucket_names` | List of buckets to ingest from; empty list = auto-discover all accessible buckets |
+| `prefix` | Optional key prefix filter (e.g. `"docs/"`) |
+
+**K8s Secret example:**
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: s3-connector-creds
+type: Opaque
+stringData:
+  access_key: "<AWS_ACCESS_KEY_ID>"
+  secret_key: "<AWS_SECRET_ACCESS_KEY>"
+  bucket_names: '["my-docs-bucket"]'
+```
+
+### Running a sync
+
+```python
+import asyncio
+from connectors.aws_s3_wrapper import sync_s3_bucket
+
+config = {
+    "access_key": "<from secret store>",
+    "secret_key": "<from secret store>",
+    "bucket_names": ["my-docs-bucket"],
+    "prefix": "docs/",
+    "scope": "joblogic-kb/s3-docs",   # fallback if CONNECTOR_SCOPE_MAPPINGS not set
+    "owner": "operator@example.com",
+}
+
+results = asyncio.run(sync_s3_bucket(config))
+for r in results:
+    print(r.verdict, r.source_uri if hasattr(r, "source_uri") else "")
+```
+
+### Identity contract
+
+| Field | Value |
+|---|---|
+| `connector_module` | `"aws_s3"` |
+| `source_uri` | `s3://{bucket}/{key}` |
+| `source_revision` | `LastModified` ISO 8601 UTC string from boto3 |
+| Rename behaviour | Object rename = new `document_id` (new document, v1). Same semantics as manual upload rename. |
+| Unchanged detection | SHA-256 of raw bytes. Same object re-fetched with identical content → `skipped_unchanged`. |
+
+### Webhook support
+
+Not implemented in W-C2.1. The connector uses pull-based sync only. Run
+`sync_s3_bucket()` on a schedule or trigger it manually. S3 event notification
+integration is a future issue.
+
+---
+
 ## Service URLs
 
 | Service | Default Port | Auth |
