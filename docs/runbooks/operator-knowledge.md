@@ -632,8 +632,10 @@ versioning, and provenance rules apply unchanged.
    "
    ```
 
-4. Store the token file in managed secret storage (K8s Secret or Vault) and mount
-   it to the service at the configured `token_file` path.
+4. Store the token file on a **writable volume** (for example a PVC) and mount it
+   at the configured `token_file` path. Do not use a K8s Secret volume for the
+   token file — K8s Secrets are mounted read-only and token refresh write-back
+   will fail. See "Token refresh write-back" below.
 
 5. Create the target scope:
    ```bash
@@ -692,13 +694,14 @@ before the sync proceeds. If the write fails, the sync is aborted with a
 **What this requires operationally:**
 
 - `token_file` must be on a **writable filesystem path** at runtime (for example
-  a PVC, a `hostPath` volume, or a writable `emptyDir`).
-- **K8s Secrets mounted as read-only volumes** (the default) will cause every
-  token refresh to fail with a `RuntimeError`. Do not mount the token file from a
-  K8s Secret volume unless the Secret is explicitly mounted as writable and the
-  Kubernetes version/driver supports it.
-- **Vault write-back is not implemented.** If your token comes from Vault, copy it
-  to a writable volume before the service starts and point `token_file` at that path.
+  a PVC or a writable `emptyDir`).
+- **Do not use a K8s Secret volume for the token file.** K8s Secrets are mounted
+  read-only by default; token refresh write-back will always fail with a
+  `RuntimeError` if the token file is not writable.
+- **Vault write-back is not implemented.** If the initial token originated from
+  Vault, copy it to a writable volume before the service starts and point
+  `token_file` at that path. Refreshed tokens are persisted only to the local
+  writable file — Vault is not updated.
 
 **Recommended setup:**
 

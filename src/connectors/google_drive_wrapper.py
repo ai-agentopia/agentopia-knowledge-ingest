@@ -126,8 +126,11 @@ def derive_source_uri(file_id: str) -> str:
 def _infer_format(mimetype: str) -> Optional[str]:
     """Map a MIME type to a knowledge-ingest format string.
 
-    Returns one of: "pdf", "docx", "html", "markdown", "txt", "xlsx", "pptx",
+    Returns one of: "pdf", "docx", "html", "markdown", "txt",
     or None if the MIME type is not supported.
+
+    Note: xlsx and pptx are not returned — Google Sheets and Google Slides are
+    skipped upstream before get_file_content() is called.
     """
     return _MIME_TO_FORMAT.get(mimetype.split(";")[0].strip().lower())
 
