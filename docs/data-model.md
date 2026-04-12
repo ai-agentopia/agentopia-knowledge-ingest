@@ -161,7 +161,7 @@ All ingest artifacts are stored in a single S3 bucket under a consistent key pre
 
 **Immutability rule:** Once an object is written under a `v{version}/` prefix, it is never overwritten. A new version always creates a new prefix. Existing prefixes are read-only after initial write.
 
-**Scope in key:** `{scope}` uses `/` as a path separator, so `joblogic-kb/api-docs` becomes `documents/joblogic-kb/api-docs/{document_id}/...`. Both AWS S3 and compatible stores (MinIO, GCS) treat `/` as a delimiter, producing a browse-friendly layout.
+**Scope in key:** `{scope}` uses `/` as a path separator, so `acme-kb/api-docs` becomes `documents/acme-kb/api-docs/{document_id}/...`. Both AWS S3 and compatible stores (MinIO, GCS) treat `/` as a delimiter, producing a browse-friendly layout.
 
 ---
 
@@ -172,14 +172,14 @@ Written by the Document Ingest Service immediately on upload, before any parsing
 ```json
 {
   "document_id":  "3f7a2b1c-...",
-  "scope":        "joblogic-kb/api-docs",
+  "scope":        "acme-kb/api-docs",
   "version":      1,
   "filename":     "api-reference.pdf",
   "format":       "pdf",
   "owner":        "operator@agentopia.io",
   "source_hash":  "sha256:a3f4b2...",
   "uploaded_at":  "2026-04-11T10:30:00Z",
-  "s3_prefix":    "documents/joblogic-kb/api-docs/3f7a2b1c-.../v1/"
+  "s3_prefix":    "documents/acme-kb/api-docs/3f7a2b1c-.../v1/"
 }
 ```
 

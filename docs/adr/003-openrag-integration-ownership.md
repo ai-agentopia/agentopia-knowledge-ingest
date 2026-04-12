@@ -45,7 +45,7 @@ The two spaces use different key prefixes so they **never collide** even when a 
 - The correct behaviour is: same logical path → same `document_id` → incremented `version`.
 
 Examples:
-- ✅ `joblogic/api-reference.pdf` (path only)
+- ✅ `acme/api-reference.pdf` (path only)
 - ✅ `https://wiki.example.com/pages/12345` (stable page ID)
 - ✅ `https://github.com/org/repo/blob/main/docs/api.md` (branch ref OK)
 - ❌ `https://github.com/org/repo/blob/a3f9c2d.../docs/api.md` (commit SHA — rejected)

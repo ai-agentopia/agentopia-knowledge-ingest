@@ -339,7 +339,7 @@ _OPERATOR_UI_HTML = """<!DOCTYPE html>
       <div class="row">
         <div>
           <label>Scope (tenant/domain)</label>
-          <input id="upScope" placeholder="joblogic-kb/api-docs">
+          <input id="upScope" placeholder="acme-kb/api-docs">
           <label>Owner (optional)</label>
           <input id="upOwner" placeholder="operator@example.com">
           <label>Document (PDF, DOCX, HTML, Markdown)</label>
@@ -361,7 +361,7 @@ _OPERATOR_UI_HTML = """<!DOCTYPE html>
     <h2 id="hDocs" onclick="toggle('sDocs','hDocs')">&#x1F4C4; Documents</h2>
     <div id="sDocs" class="section-body">
       <div style="display:flex;gap:8px;align-items:flex-end;margin-bottom:10px">
-        <div style="flex:1"><label>Scope</label><input id="docScope" placeholder="joblogic-kb/api-docs"></div>
+        <div style="flex:1"><label>Scope</label><input id="docScope" placeholder="acme-kb/api-docs"></div>
         <div><label>Status</label>
           <select id="docStatus">
             <option value="active">active</option>
@@ -433,7 +433,7 @@ _OPERATOR_UI_HTML = """<!DOCTYPE html>
         <div style="display:flex;gap:8px;align-items:flex-end;margin-bottom:8px">
           <div style="flex:1">
             <label>Scope — regression history</label>
-            <input id="bsScope" placeholder="joblogic-kb/api-docs">
+            <input id="bsScope" placeholder="acme-kb/api-docs">
           </div>
           <button onclick="loadResults()" class="secondary">Load History</button>
           <span id="resultsErr" style="color:#842029;font-size:0.82rem;display:none"></span>
@@ -461,7 +461,7 @@ _OPERATOR_UI_HTML = """<!DOCTYPE html>
         </div>
         <div>
           <label>Scope</label>
-          <input id="dbgScope" placeholder="joblogic-kb/api-docs">
+          <input id="dbgScope" placeholder="acme-kb/api-docs">
           <label>Query</label>
           <input id="dbgQuery" placeholder="How do I authenticate?">
           <button onclick="doDebug()">Run Query</button>
@@ -485,7 +485,7 @@ _OPERATOR_UI_HTML = """<!DOCTYPE html>
       <div class="row">
         <div>
           <label>Scope (tenant/domain)</label>
-          <input id="s3Scope" placeholder="joblogic-kb/s3-docs">
+          <input id="s3Scope" placeholder="acme-kb/s3-docs">
           <label>Bucket</label>
           <input id="s3Bucket" placeholder="my-docs-bucket">
           <p style="font-size:0.78rem;color:#555;margin:-6px 0 8px">
@@ -528,7 +528,7 @@ _OPERATOR_UI_HTML = """<!DOCTYPE html>
           <label>connector_module</label>
           <input id="connModule" placeholder="aws_s3, openrag, custom_connector …">
           <label>Scope (tenant/domain)</label>
-          <input id="connScope" placeholder="joblogic-kb/api-docs">
+          <input id="connScope" placeholder="acme-kb/api-docs">
           <label>source_uri</label>
           <input id="connSourceUri" placeholder="s3://bucket/path.pdf">
           <label>Format</label>
@@ -581,7 +581,7 @@ _OPERATOR_UI_HTML = """<!DOCTYPE html>
       <div class="row">
         <div>
           <label>Scope (tenant/domain)</label>
-          <input id="gdriveScope" placeholder="joblogic-kb/gdrive-docs">
+          <input id="gdriveScope" placeholder="acme-kb/gdrive-docs">
           <label>Owner (optional)</label>
           <input id="gdriveOwner" placeholder="operator@example.com">
         </div>

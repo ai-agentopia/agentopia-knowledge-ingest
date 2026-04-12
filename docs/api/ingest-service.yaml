@@ -70,7 +70,7 @@ paths:
                 scope:
                   type: string
                   description: Target scope in {tenant}/{domain} format
-                  example: joblogic-kb/api-docs
+                  example: acme-kb/api-docs
                 owner:
                   type: string
                   description: Operator identifier for audit log
@@ -161,7 +161,7 @@ paths:
           schema:
             type: string
           description: Scope to list documents for
-          example: joblogic-kb/api-docs
+          example: acme-kb/api-docs
         - name: status
           in: query
           required: false
@@ -341,7 +341,7 @@ paths:
                   type: string
                   pattern: "^[a-z0-9-]+/[a-z0-9-]+$"
                   description: Scope identifier in {tenant}/{domain} format
-                  example: joblogic-kb/api-docs
+                  example: acme-kb/api-docs
                 description:
                   type: string
                   description: Human-readable description of this scope
@@ -532,7 +532,7 @@ components:
           format: uuid
         scope_name:
           type: string
-          example: joblogic-kb/api-docs
+          example: acme-kb/api-docs
         description:
           type: string
           nullable: true
@@ -557,7 +557,7 @@ components:
         detail:
           type: string
           description: Human-readable explanation
-          example: "Scope 'joblogic-kb/unknown' does not exist. Create it with POST /scopes."
+          example: "Scope 'acme-kb/unknown' does not exist. Create it with POST /scopes."
         request_id:
           type: string
           format: uuid
