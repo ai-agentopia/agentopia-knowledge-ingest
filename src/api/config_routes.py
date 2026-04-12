@@ -40,9 +40,16 @@ async def google_picker_config() -> GooglePickerConfigResponse:
     Auth: none — these values are browser-intended and safe to expose.
     """
     s = get_settings()
+    # Treat literal "PLACEHOLDER" (or empty) as unconfigured — guards against
+    # Helm chart defaults reaching production accidentally.
+    def _real(v: str) -> str:
+        return "" if (not v or v == "PLACEHOLDER") else v
+
+    api_key = _real(s.google_picker_api_key)
+    client_id = _real(s.google_picker_client_id)
     return GooglePickerConfigResponse(
-        api_key=s.google_picker_api_key,
-        client_id=s.google_picker_client_id,
-        app_id=s.google_picker_app_id,
-        configured=bool(s.google_picker_api_key and s.google_picker_client_id),
+        api_key=api_key,
+        client_id=client_id,
+        app_id=_real(s.google_picker_app_id),
+        configured=bool(api_key and client_id),
     )
