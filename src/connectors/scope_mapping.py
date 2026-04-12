@@ -30,7 +30,7 @@ Rules are evaluated in order; the first match wins.
 
 Example (env var):
   export CONNECTOR_SCOPE_MAPPINGS='[
-    {"connector_module": "openrag", "source_pattern": "joblogic/*",   "scope": "joblogic-kb/docs"},
+    {"connector_module": "openrag", "source_pattern": "acme/*",   "scope": "acme-kb/docs"},
     {"connector_module": "openrag", "source_pattern": "portal/*",     "scope": "portal-kb/docs"},
     {"connector_module": "openrag", "source_pattern": "*",            "scope": "default-kb/general"}
   ]'
@@ -40,15 +40,15 @@ Example (config file):
 
   # /etc/agentopia/connector-scopes.json
   [
-    {"connector_module": "openrag", "source_pattern": "joblogic/*",   "scope": "joblogic-kb/docs"},
+    {"connector_module": "openrag", "source_pattern": "acme/*",   "scope": "acme-kb/docs"},
     {"connector_module": "openrag", "source_pattern": "*",            "scope": "default-kb/general"}
   ]
 
 Usage:
   from connectors.scope_mapping import resolve_scope
 
-  scope = resolve_scope("openrag", "joblogic/api-reference.pdf")
-  # → "joblogic-kb/docs"  (first matching rule)
+  scope = resolve_scope("openrag", "acme/api-reference.pdf")
+  # → "acme-kb/docs"  (first matching rule)
 
   scope = resolve_scope("openrag", "unknown/path.pdf")
   # → "default-kb/general"  (wildcard catch-all)

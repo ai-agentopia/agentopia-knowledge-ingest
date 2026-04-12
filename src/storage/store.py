@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 def _s3_prefix(scope: str, document_id: str, version: int) -> str:
     """Return the S3 key prefix for a document version.
 
-    Scope may contain '/' (e.g. 'joblogic-kb/api-docs'), which S3 treats
+    Scope may contain '/' (e.g. 'acme-kb/api-docs'), which S3 treats
     as a path delimiter — producing a human-browsable layout.
     """
     return f"documents/{scope}/{document_id}/v{version}/"

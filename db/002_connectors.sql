@@ -18,7 +18,7 @@ ALTER TABLE documents ADD COLUMN IF NOT EXISTS connector_module VARCHAR(255);
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS source_uri TEXT;
 -- Stable logical locator for the external source document.
 -- Must NOT contain volatile revision selectors (no commit SHAs, no ?ref=<sha>).
--- Example: "joblogic/api-reference.pdf" — branch name OK, commit SHA NOT OK.
+-- Example: "acme/api-reference.pdf" — branch name OK, commit SHA NOT OK.
 
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS source_revision TEXT;
 -- IMMUTABLE per row. Set once on INSERT by the connector adapter.

@@ -259,13 +259,13 @@ def _sha256(b: bytes) -> str:
 def _make_event(
     raw_bytes=b"# API Reference\n\nAuthentication section.\n",
     source_revision="rev1",
-    scope="joblogic-kb/docs",
+    scope="acme-kb/docs",
 ):
     from connectors.adapter import ConnectorEvent
     return ConnectorEvent(
         connector_module="openrag",
         scope=scope,
-        source_uri="joblogic/api-reference.md",
+        source_uri="acme/api-reference.md",
         filename="api-reference.md",
         format="markdown",
         raw_bytes=raw_bytes,
@@ -341,7 +341,7 @@ class TestConnectorAdapterStubbed(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         row = rows[0]
         self.assertEqual(row["connector_module"], "openrag")
-        self.assertEqual(row["source_uri"], "joblogic/api-reference.md")
+        self.assertEqual(row["source_uri"], "acme/api-reference.md")
         self.assertEqual(row["source_revision"], "git-sha-123",
                          "source_revision must be immutably set from event")
 
@@ -448,7 +448,7 @@ class TestConnectorAdapterStubbed(unittest.TestCase):
         reg, sync = self._reg_sync()
         result, resolve_mock = _run_stubbed(_make_event(), reg, sync)
 
-        resolve_mock.assert_called_once_with("openrag", "joblogic/api-reference.md")
+        resolve_mock.assert_called_once_with("openrag", "acme/api-reference.md")
 
     def test_resolve_scope_result_overrides_event_scope(self):
         """When resolve_scope returns a scope, it must be used instead of event.scope."""
@@ -525,9 +525,9 @@ class TestConnectorAdapterStubbed(unittest.TestCase):
 
     def test_registered_scope_proceeds_normally(self):
         """When scope is registered, the pipeline proceeds to fetched_new."""
-        reg = _InMemoryRegistry(known_scopes={"joblogic-kb/docs"})
+        reg = _InMemoryRegistry(known_scopes={"acme-kb/docs"})
         sync = _InMemoryConnectorSync()
-        event = _make_event(scope="joblogic-kb/docs")
+        event = _make_event(scope="acme-kb/docs")
         result, _ = _run_stubbed(event, reg, sync, resolved_scope=None)
         self.assertEqual(result.verdict, "fetched_new")
 
@@ -648,7 +648,7 @@ class TestConnectorAdapterRealPipeline(unittest.TestCase):
 
         active = self.reg.active_row(result.document_id)
         self.assertEqual(active["connector_module"], "openrag")
-        self.assertEqual(active["source_uri"], "joblogic/api-reference.md")
+        self.assertEqual(active["source_uri"], "acme/api-reference.md")
         self.assertEqual(active["source_revision"], "git-abc123",
                          "source_revision must be immutable provenance from event")
 

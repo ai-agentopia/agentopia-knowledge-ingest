@@ -36,8 +36,8 @@ class TestIdentityCoexistence(unittest.TestCase):
 
     def test_manual_id_is_stable(self):
         """Same (scope, filename) always produces the same manual document_id."""
-        id1 = stable_document_id_manual("joblogic-kb/docs", "api-reference.pdf")
-        id2 = stable_document_id_manual("joblogic-kb/docs", "api-reference.pdf")
+        id1 = stable_document_id_manual("acme-kb/docs", "api-reference.pdf")
+        id2 = stable_document_id_manual("acme-kb/docs", "api-reference.pdf")
         self.assertEqual(id1, id2)
 
     # ── Test 2: Connector ID stability ───────────────────────────────────────
@@ -45,10 +45,10 @@ class TestIdentityCoexistence(unittest.TestCase):
     def test_connector_id_is_stable(self):
         """Same (scope, connector_module, source_uri) always produces the same connector document_id."""
         id1 = stable_document_id_connector(
-            "joblogic-kb/docs", "openrag", "joblogic/api-reference.pdf"
+            "acme-kb/docs", "openrag", "acme/api-reference.pdf"
         )
         id2 = stable_document_id_connector(
-            "joblogic-kb/docs", "openrag", "joblogic/api-reference.pdf"
+            "acme-kb/docs", "openrag", "acme/api-reference.pdf"
         )
         self.assertEqual(id1, id2)
 
@@ -61,7 +61,7 @@ class TestIdentityCoexistence(unittest.TestCase):
         are separated by key prefix so collision is impossible even when
         an operator manually uploads the same file that a connector also syncs.
         """
-        scope = "joblogic-kb/docs"
+        scope = "acme-kb/docs"
         filename = "api-reference.pdf"
 
         manual_id = stable_document_id_manual(scope, filename)
@@ -77,10 +77,10 @@ class TestIdentityCoexistence(unittest.TestCase):
     def test_different_source_uris_produce_different_connector_ids(self):
         """Two distinct source_uris under the same connector produce distinct document_ids."""
         id_a = stable_document_id_connector(
-            "joblogic-kb/docs", "openrag", "joblogic/api-reference.pdf"
+            "acme-kb/docs", "openrag", "acme/api-reference.pdf"
         )
         id_b = stable_document_id_connector(
-            "joblogic-kb/docs", "openrag", "joblogic/quickstart-guide.pdf"
+            "acme-kb/docs", "openrag", "acme/quickstart-guide.pdf"
         )
         self.assertNotEqual(
             id_a, id_b,
@@ -95,9 +95,9 @@ class TestIdentityCoexistence(unittest.TestCase):
         This matters if the same URL is accessible by both an OpenRAG connector and
         a direct Confluence connector — they should not silently overwrite each other.
         """
-        source_uri = "joblogic/api-reference.pdf"
-        id_openrag = stable_document_id_connector("joblogic-kb/docs", "openrag", source_uri)
-        id_confluence = stable_document_id_connector("joblogic-kb/docs", "confluence", source_uri)
+        source_uri = "acme/api-reference.pdf"
+        id_openrag = stable_document_id_connector("acme-kb/docs", "openrag", source_uri)
+        id_confluence = stable_document_id_connector("acme-kb/docs", "confluence", source_uri)
         self.assertNotEqual(
             id_openrag, id_confluence,
             "Same source_uri under different connector_modules must produce different document_ids",
@@ -116,7 +116,7 @@ class TestIdentityCoexistence(unittest.TestCase):
         volatile_uri = f"https://github.com/org/repo/blob/{commit_sha}/docs/api.md"
 
         with self.assertRaises(ValueError) as ctx:
-            stable_document_id_connector("joblogic-kb/docs", "openrag", volatile_uri)
+            stable_document_id_connector("acme-kb/docs", "openrag", volatile_uri)
 
         error_msg = str(ctx.exception)
         # Error must mention source_revision so the developer knows the fix
@@ -129,7 +129,7 @@ class TestIdentityCoexistence(unittest.TestCase):
 
     def test_stable_document_id_alias_matches_manual(self):
         """stable_document_id() (legacy alias) produces the same ID as stable_document_id_manual()."""
-        scope = "joblogic-kb/docs"
+        scope = "acme-kb/docs"
         filename = "api-reference.pdf"
         self.assertEqual(
             stable_document_id(scope, filename),

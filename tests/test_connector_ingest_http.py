@@ -210,7 +210,7 @@ class TestEventConstruction:
         raw = b"test document content"
         body = _minimal_body(
             connector_module="aws_s3",
-            scope="joblogic-kb/docs",
+            scope="acme-kb/docs",
             source_uri="s3://bucket/path/file.pdf",
             filename="file.pdf",
             format="pdf",
@@ -226,7 +226,7 @@ class TestEventConstruction:
         assert resp.status_code == 200
         ev = captured["event"]
         assert ev.connector_module == "aws_s3"
-        assert ev.scope == "joblogic-kb/docs"
+        assert ev.scope == "acme-kb/docs"
         assert ev.source_uri == "s3://bucket/path/file.pdf"
         assert ev.filename == "file.pdf"
         assert ev.format == "pdf"

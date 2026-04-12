@@ -95,8 +95,8 @@ class TestStableDocumentId(unittest.TestCase):
     """stable_document_id must be deterministic and stable."""
 
     def test_same_inputs_same_id(self):
-        id1 = stable_document_id("joblogic-kb/api-docs", "guide.md")
-        id2 = stable_document_id("joblogic-kb/api-docs", "guide.md")
+        id1 = stable_document_id("acme-kb/api-docs", "guide.md")
+        id2 = stable_document_id("acme-kb/api-docs", "guide.md")
         self.assertEqual(id1, id2)
 
     def test_different_scope_different_id(self):
@@ -966,7 +966,7 @@ class TestScopeNameValidation(unittest.TestCase):
     PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]*/[a-z0-9][a-z0-9-]*$")
 
     def test_valid_scopes(self):
-        for s in ["joblogic-kb/api-docs", "tenant1/domain", "a/b"]:
+        for s in ["acme-kb/api-docs", "tenant1/domain", "a/b"]:
             self.assertTrue(self.PATTERN.match(s), f"Should be valid: {s}")
 
     def test_invalid_scopes(self):

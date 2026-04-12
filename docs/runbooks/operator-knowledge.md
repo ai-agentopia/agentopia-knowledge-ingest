@@ -34,12 +34,12 @@ Before uploading documents, a scope must exist.
 ```bash
 curl -X POST http://localhost:8003/scopes \
   -H "Content-Type: application/json" \
-  -d '{"scope_name": "joblogic-kb/api-docs", "description": "Joblogic API documentation", "owner": "operator@example.com"}'
+  -d '{"scope_name": "acme-kb/api-docs", "description": "Acme API documentation", "owner": "operator@example.com"}'
 ```
 
 **Via UI:** Use the Scopes section.
 
-Scope names must match `{tenant}/{domain}` — lowercase letters, digits, and hyphens only. Example: `joblogic-kb/api-docs`, `customer-portal/onboarding`.
+Scope names must match `{tenant}/{domain}` — lowercase letters, digits, and hyphens only. Example: `acme-kb/api-docs`, `customer-portal/onboarding`.
 
 ---
 
@@ -47,13 +47,13 @@ Scope names must match `{tenant}/{domain}` — lowercase letters, digits, and hy
 
 **Via API:**
 ```bash
-curl -X POST "http://localhost:8003/documents/upload?scope=joblogic-kb/api-docs&owner=operator@example.com" \
+curl -X POST "http://localhost:8003/documents/upload?scope=acme-kb/api-docs&owner=operator@example.com" \
   -F "file=@/path/to/api-reference.pdf"
 ```
 
 **Response:**
 ```json
-{"job_id": "...", "document_id": "...", "scope": "joblogic-kb/api-docs", "version": 1, "skipped": false}
+{"job_id": "...", "document_id": "...", "scope": "acme-kb/api-docs", "version": 1, "skipped": false}
 ```
 
 The upload returns immediately. The document is not yet visible to retrieval — it must pass through normalization, extraction, and indexing before reaching `active` state.
@@ -74,14 +74,14 @@ States: `submitted` → `normalizing` → `normalized` → `extracting` → `ext
 Once the job reaches `active`, the document is visible to retrieval queries.
 
 ```bash
-curl "http://localhost:8003/documents?scope=joblogic-kb/api-docs&status=active"
+curl "http://localhost:8003/documents?scope=acme-kb/api-docs&status=active"
 ```
 
 Each active document shows: `filename`, `format`, `version`, `status`, `created_at`, `updated_at`.
 
 Use the retrieval debugger to confirm the document appears in search results:
 ```bash
-curl "http://localhost:8002/api/v1/knowledge/debug/query?scope=joblogic-kb/api-docs&q=authentication" \
+curl "http://localhost:8002/api/v1/knowledge/debug/query?scope=acme-kb/api-docs&q=authentication" \
   -H "X-Internal-Token: $SUPER_RAG_INTERNAL_TOKEN"
 ```
 
@@ -92,7 +92,7 @@ curl "http://localhost:8002/api/v1/knowledge/debug/query?scope=joblogic-kb/api-d
 To replace a document, upload the new version using the same filename. The `document_id` is stable — derived from `(scope, filename)`.
 
 ```bash
-curl -X POST "http://localhost:8003/documents/upload?scope=joblogic-kb/api-docs" \
+curl -X POST "http://localhost:8003/documents/upload?scope=acme-kb/api-docs" \
   -F "file=@/path/to/api-reference-v2.pdf"
 ```
 
@@ -154,13 +154,13 @@ The prior active version (if any) remains unaffected when ingest fails — retri
 
 **Check per-scope baseline:**
 ```bash
-curl "http://localhost:8002/api/v1/evaluation/baselines/joblogic-kb/api-docs" \
+curl "http://localhost:8002/api/v1/evaluation/baselines/acme-kb/api-docs" \
   -H "X-Internal-Token: $SUPER_RAG_INTERNAL_TOKEN"
 ```
 
 **View recent evaluation runs:**
 ```bash
-curl "http://localhost:8002/api/v1/evaluation/results?scope=joblogic-kb/api-docs" \
+curl "http://localhost:8002/api/v1/evaluation/results?scope=acme-kb/api-docs" \
   -H "X-Internal-Token: $SUPER_RAG_INTERNAL_TOKEN"
 ```
 
@@ -184,7 +184,7 @@ Golden questions define the expected quality bar for a scope. They must be autho
 
 ```bash
 # Add a golden question
-curl -X POST "http://localhost:8002/api/v1/evaluation/questions/joblogic-kb/api-docs" \
+curl -X POST "http://localhost:8002/api/v1/evaluation/questions/acme-kb/api-docs" \
   -H "X-Internal-Token: $SUPER_RAG_INTERNAL_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -198,7 +198,7 @@ curl -X POST "http://localhost:8002/api/v1/evaluation/questions/joblogic-kb/api-
   }'
 
 # Establish baseline
-curl -X POST "http://localhost:8002/api/v1/evaluation/baselines/joblogic-kb/api-docs" \
+curl -X POST "http://localhost:8002/api/v1/evaluation/baselines/acme-kb/api-docs" \
   -H "X-Internal-Token: $SUPER_RAG_INTERNAL_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"notes": "Initial baseline after pilot documents indexed"}'
@@ -213,7 +213,7 @@ Relevance grades: 2 = fully relevant, 1 = partially relevant, 0 = not relevant.
 When search results are unexpected, use the retrieval debugger to inspect ranked chunks:
 
 ```bash
-curl "http://localhost:8002/api/v1/knowledge/debug/query?scope=joblogic-kb/api-docs&q=authentication&limit=5" \
+curl "http://localhost:8002/api/v1/knowledge/debug/query?scope=acme-kb/api-docs&q=authentication&limit=5" \
   -H "X-Internal-Token: $SUPER_RAG_INTERNAL_TOKEN"
 ```
 
@@ -257,7 +257,7 @@ Create the scope via POST /scopes before connector ingestion proceeds.
 
 ```bash
 export CONNECTOR_SCOPE_MAPPINGS='[
-  {"connector_module": "openrag", "source_pattern": "joblogic/*",   "scope": "joblogic-kb/docs"},
+  {"connector_module": "openrag", "source_pattern": "acme/*",   "scope": "acme-kb/docs"},
   {"connector_module": "openrag", "source_pattern": "portal/*",     "scope": "portal-kb/docs"},
   {"connector_module": "openrag", "source_pattern": "*",            "scope": "default-kb/general"}
 ]'
@@ -271,7 +271,7 @@ export CONNECTOR_SCOPE_MAPPINGS_FILE=/etc/agentopia/connector-scopes.json
 
 ```json
 [
-  {"connector_module": "openrag", "source_pattern": "joblogic/*",   "scope": "joblogic-kb/docs"},
+  {"connector_module": "openrag", "source_pattern": "acme/*",   "scope": "acme-kb/docs"},
   {"connector_module": "openrag", "source_pattern": "portal/*",     "scope": "portal-kb/docs"},
   {"connector_module": "openrag", "source_pattern": "*",            "scope": "default-kb/general"}
 ]
@@ -297,7 +297,7 @@ as the last rule to ensure every document lands somewhere.
    ```bash
    curl -X POST http://localhost:8003/scopes \
      -H "Content-Type: application/json" \
-     -d '{"scope_name": "joblogic-kb/docs", "description": "Joblogic docs", "owner": "operator@example.com"}'
+     -d '{"scope_name": "acme-kb/docs", "description": "Acme docs", "owner": "operator@example.com"}'
    ```
 
 2. Set the mapping configuration (env var or file).
@@ -337,7 +337,7 @@ curl -X POST http://localhost:8003/connectors/ingest \
   -H "Content-Type: application/json" \
   -d '{
     "connector_module": "aws_s3",
-    "scope": "joblogic-kb/docs",
+    "scope": "acme-kb/docs",
     "source_uri": "s3://my-bucket/docs/api-reference.pdf",
     "filename": "api-reference.pdf",
     "format": "pdf",
@@ -427,7 +427,7 @@ For Kubernetes, store these as a K8s Secret and inject into the pod env. Never h
 curl -X POST http://localhost:8003/connectors/s3/sync \
   -H "Content-Type: application/json" \
   -d '{
-    "scope": "joblogic-kb/s3-docs",
+    "scope": "acme-kb/s3-docs",
     "bucket": "my-docs-bucket",
     "secret_ref": "prod",
     "prefix": "docs/",
@@ -445,7 +445,7 @@ Credentials must already be set in the service environment — do not enter acce
 
 ```json
 {
-  "scope": "joblogic-kb/s3-docs",
+  "scope": "acme-kb/s3-docs",
   "bucket": "my-docs-bucket",
   "total": 3,
   "results": [
@@ -519,13 +519,13 @@ validation, dedup, versioning, and provenance rules apply unchanged.
    ```bash
    curl -X POST http://localhost:8003/scopes \
      -H "Content-Type: application/json" \
-     -d '{"scope_name": "joblogic-kb/s3-docs", "description": "S3 documents", "owner": "operator@example.com"}'
+     -d '{"scope_name": "acme-kb/s3-docs", "description": "S3 documents", "owner": "operator@example.com"}'
    ```
 
 2. Configure scope mapping for the S3 connector:
    ```bash
    export CONNECTOR_SCOPE_MAPPINGS='[
-     {"connector_module": "aws_s3", "source_pattern": "s3://my-bucket/*", "scope": "joblogic-kb/s3-docs"}
+     {"connector_module": "aws_s3", "source_pattern": "s3://my-bucket/*", "scope": "acme-kb/s3-docs"}
    ]'
    ```
 
@@ -568,7 +568,7 @@ config = {
     "secret_key": "<from secret store>",
     "bucket_names": ["my-docs-bucket"],
     "prefix": "docs/",
-    "scope": "joblogic-kb/s3-docs",   # fallback if CONNECTOR_SCOPE_MAPPINGS not set
+    "scope": "acme-kb/s3-docs",   # fallback if CONNECTOR_SCOPE_MAPPINGS not set
     "owner": "operator@example.com",
 }
 
@@ -641,13 +641,13 @@ versioning, and provenance rules apply unchanged.
    ```bash
    curl -X POST http://localhost:8003/scopes \
      -H "Content-Type: application/json" \
-     -d '{"scope_name": "joblogic-kb/gdrive-docs", "description": "Google Drive documents", "owner": "operator@example.com"}'
+     -d '{"scope_name": "acme-kb/gdrive-docs", "description": "Google Drive documents", "owner": "operator@example.com"}'
    ```
 
 6. Configure scope mapping for the Google Drive connector:
    ```bash
    export CONNECTOR_SCOPE_MAPPINGS='[
-     {"connector_module": "google_drive", "source_pattern": "gdrive://*", "scope": "joblogic-kb/gdrive-docs"}
+     {"connector_module": "google_drive", "source_pattern": "gdrive://*", "scope": "acme-kb/gdrive-docs"}
    ]'
    ```
 
@@ -745,7 +745,7 @@ config = {
     "client_secret": "<from secret store>",
     "token_file": "/var/secrets/gdrive/token.json",
     "folder_ids": ["1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms"],  # optional
-    "scope": "joblogic-kb/gdrive-docs",  # fallback if CONNECTOR_SCOPE_MAPPINGS not set
+    "scope": "acme-kb/gdrive-docs",  # fallback if CONNECTOR_SCOPE_MAPPINGS not set
     "owner": "operator@example.com",
 }
 
