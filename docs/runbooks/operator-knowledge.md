@@ -962,9 +962,12 @@ recursively, and calls `ingest_from_connector()` for each supported document.
   to `token_file` (write-to-temp + `os.replace`).
 - If the write fails (e.g. disk full, path unwritable), `authenticate()` raises
   `RuntimeError` and the sync is aborted — **no files are ingested** (fail closed).
-- **K8s Secret write-back is NOT implemented.** If token_file is mounted from a K8s Secret
-  volume, ensure the volume is writable (projected volume or a PVC mount). Read-only mounts
-  will cause sync failure on every token refresh.
+- **K8s Secret write-back is NOT implemented.** Do not point `token_file` at a K8s Secret
+  volume — K8s Secrets are mounted read-only; every token refresh attempt will fail with
+  `RuntimeError`. Use a writable filesystem path instead (for example a PVC or `emptyDir`).
+- **Vault write-back is NOT implemented.** If the initial token originated from Vault, copy
+  it to a writable path before the service starts. Refreshed tokens are persisted only to
+  the local `token_file` — Vault is not updated.
 
 ### Initial OAuth flow (operator one-time setup)
 
