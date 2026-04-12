@@ -81,6 +81,12 @@ def _reset():
         fp = _os.path.join(_TMP_STORE, f)
         if _os.path.isdir(fp):
             shutil.rmtree(fp, ignore_errors=True)
+    # Re-pin STORAGE_LOCAL_PATH to this module's temp dir and bust the
+    # settings cache, so storage writes land in _TMP_STORE even when
+    # another test module set STORAGE_LOCAL_PATH first (lru_cache race).
+    os.environ["STORAGE_LOCAL_PATH"] = _TMP_STORE
+    from config import get_settings
+    get_settings.cache_clear()
 
 
 # ── Stable document_id validation ─────────────────────────────────────────────
