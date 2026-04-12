@@ -934,6 +934,107 @@ This is a one-time setup, outside the scope of the picker code:
 
 ---
 
+## Section 17 — W-C2.4: OneDrive Server-Side Sync Wrapper
+
+`sync_onedrive(config)` in `src/connectors/onedrive_wrapper.py`.
+
+This is a **server-side pull-based sync** of an organizational OneDrive (work/school
+accounts). It authenticates via MSAL, resolves the user's default driveId, lists all files
+recursively, and calls `ingest_from_connector()` for each supported document.
+
+### Required config dict keys
+
+| Key | Description |
+|---|---|
+| `client_id` | Azure AD / Microsoft Entra application client ID. Load from managed secret storage (K8s Secret, Vault). |
+| `client_secret` | Application client secret. Load from managed secret storage. Never hardcode. |
+| `tenant_id` | Azure AD / Entra tenant ID (directory ID). |
+| `token_file` | Absolute path to the MSAL `SerializableTokenCache` JSON file. Must be writable by the service. The operator populates this file via the initial OAuth flow (see below). |
+| `scope` | Target knowledge scope (e.g. `"team/onedrive"`). |
+| `owner` | Optional actor identifier for audit log. |
+
+### Token persistence model (exact supported contract)
+
+**Token file on disk is the sole persistence layer.**
+
+- After successful `acquire_token_silent()`, if the MSAL token cache state has changed
+  (i.e., the access token was refreshed), the updated cache is atomically written back
+  to `token_file` (write-to-temp + `os.replace`).
+- If the write fails (e.g. disk full, path unwritable), `authenticate()` raises
+  `RuntimeError` and the sync is aborted — **no files are ingested** (fail closed).
+- **K8s Secret write-back is NOT implemented.** If token_file is mounted from a K8s Secret
+  volume, ensure the volume is writable (projected volume or a PVC mount). Read-only mounts
+  will cause sync failure on every token refresh.
+
+### Initial OAuth flow (operator one-time setup)
+
+The `token_file` must be pre-populated before the first sync. This is an out-of-band step:
+
+1. Register an application in Azure Portal (Microsoft Entra ID → App Registrations).
+2. Grant delegated API permissions: `Files.Read.All` and `User.Read` (Microsoft Graph).
+3. Run a device-code or authorization-code flow to obtain an initial token set and serialize
+   the resulting MSAL `SerializableTokenCache` to `token_file`.
+4. Mount `token_file` at the configured path on the service pod (writable).
+5. Set `client_id`, `client_secret`, and `tenant_id` via K8s Secret env vars or Vault.
+
+### Identity contract (aligned with W-C2.4/#40)
+
+| Field | Value |
+|---|---|
+| `connector_module` | `"onedrive"` |
+| `source_uri` | `onedrive://{driveId}/{itemId}` — stable across file renames within the same drive |
+| `source_revision` | `lastModifiedDateTime` ISO 8601 from Microsoft Graph. Stored once on INSERT (W-C1.6 provenance immutability). |
+| Rename stability | OneDrive `itemId` is stable across renames within the same drive. A cross-drive move produces a new `driveId` → new `document_id` (as expected). |
+| Sharing IDs | Items whose `id` starts with `s` (plain) or whose right-hand component after `!` starts with `s` (composite) are sharing IDs. They are **not stable locators** — skipped with WARNING, never ingested. |
+
+### driveId resolution
+
+The wrapper calls `GET /me/drive?$select=id` once at initialization to resolve the
+authenticated user's default `driveId`. This is cached per connector instance. If the
+call fails, the sync aborts (fail closed — no files are ingested).
+
+The resolved `driveId` is used for plain itemIds (Case 1). For composite `driveId!itemId`
+IDs returned by Graph (Case 2), the embedded driveId is used directly.
+
+### Supported file formats
+
+| MIME type | Format |
+|---|---|
+| `application/pdf` | `pdf` |
+| `application/vnd.openxmlformats-officedocument.wordprocessingml.document` | `docx` |
+| `text/html` | `html` |
+| `text/markdown` / `text/x-markdown` | `markdown` |
+| `text/plain` | `txt` |
+
+Files with other MIME types (e.g. Excel, PowerPoint, video) are skipped at the wrapper
+boundary — no content is downloaded for unsupported types.
+
+### Sharing ID skip behavior
+
+Graph API search results may include items with sharing IDs. These are ephemeral identifiers
+assigned to items accessed via sharing links. They are not stable logical locators and
+must not be used as `source_uri` (would violate the W-C1 stable locator contract).
+
+The wrapper detects and skips them:
+- **Plain form:** `file["id"]` starts with `s` → skipped, WARNING logged
+- **Composite form:** `file["id"]` contains `!` and the right-hand part starts with `s` → skipped, WARNING logged
+
+The WARNING includes the raw `file_id` value (not the access token or any credential).
+
+### What this wrapper does NOT do
+
+- Write directly to `documents`, `connector_sync_tasks`, or `ingest_jobs` tables.
+- Call the normalizer, extractor, or orchestrator directly.
+- Bypass scope registry validation (W-C1.9) or source_hash dedup (W-C1.10).
+- Implement browser OAuth flow.
+- Implement webhook/subscription-based incremental sync (out of scope for #40).
+- Log any credential value (client_id, client_secret, access token) at any log level.
+
+Note: This wrapper targets organizational OneDrive (work/school accounts) only.
+Microsoft Graph change notifications may not be available for personal (MSA) accounts.
+
+---
+
 ## Service URLs
 
 | Service | Default Port | Auth |
