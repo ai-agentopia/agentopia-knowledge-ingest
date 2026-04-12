@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from api.config_routes import router as config_router
 from api.connector_routes import router as connector_router
 from api.routes import router
 from api.s3_routes import router as s3_router
@@ -93,3 +94,4 @@ app = FastAPI(
 app.include_router(router)
 app.include_router(connector_router)
 app.include_router(s3_router)
+app.include_router(config_router)
