@@ -106,6 +106,11 @@ class ConnectorIngestResponse(BaseModel):
     job_id: Optional[str] = None
     version: Optional[int] = None
     error_message: Optional[str] = None
+    document_status: Optional[str] = None
+    chunks_created: Optional[int] = None
+    chunks_skipped: Optional[int] = None
+    pipeline_error: Optional[str] = None
+    stage_failed: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -189,4 +194,9 @@ async def connector_ingest(body: ConnectorIngestRequest) -> ConnectorIngestRespo
         job_id=result.job_id,
         version=result.version,
         error_message=result.error_message,
+        document_status=result.document_status,
+        chunks_created=result.chunks_created,
+        chunks_skipped=result.chunks_skipped,
+        pipeline_error=result.pipeline_error,
+        stage_failed=result.stage_failed,
     )

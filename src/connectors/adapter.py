@@ -53,7 +53,7 @@ from dataclasses import dataclass, field
 from connectors.scope_mapping import resolve_scope
 from db import registry
 from db.connector_sync import create_sync_task, get_task, mark_fetching, set_verdict
-from orchestrator import run_pipeline
+from orchestrator import PipelineResult, run_pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +100,11 @@ class SyncResult:
         job_id:     Set when an ingest job was created. None otherwise.
         version:    Document version number. None for skipped/failed.
         error_message: Set on fetch_failed verdict.
+        document_status: Final document status after pipeline: "active" | "failed" | None.
+        chunks_created: Number of chunks created by Super RAG ingest.
+        chunks_skipped: Number of chunks skipped (idempotent re-ingest).
+        pipeline_error: Error message from the pipeline stage that failed.
+        stage_failed: Which pipeline stage failed (normalization, indexing, etc.).
     """
 
     task_id: str
@@ -109,6 +114,11 @@ class SyncResult:
     version: int | None = None
     error_message: str | None = None
     source_uri: str = ""
+    document_status: str | None = None
+    chunks_created: int | None = None
+    chunks_skipped: int | None = None
+    pipeline_error: str | None = None
+    stage_failed: str | None = None
 
 
 def ingest_from_connector(event: ConnectorEvent) -> SyncResult:
@@ -298,8 +308,9 @@ def ingest_from_connector(event: ConnectorEvent) -> SyncResult:
     # ── Step 8: Run ingest pipeline (synchronous) ─────────────────────────────
     # Sync verdict is already finalized above. Orchestrator failure only affects
     # the document row and ingest_job, not the sync task.
+    pipeline: PipelineResult | None = None
     try:
-        run_pipeline(
+        pipeline = run_pipeline(
             job_id=job_id,
             row_id=row_id,
             document_id=document_id,
@@ -323,6 +334,7 @@ def ingest_from_connector(event: ConnectorEvent) -> SyncResult:
             registry.update_job(job_id, status="failed", error_message=str(exc), completed=True)
         except Exception:
             pass
+        pipeline = PipelineResult(status="failed", error_message=str(exc))
 
     return SyncResult(
         task_id=task_id,
@@ -331,6 +343,11 @@ def ingest_from_connector(event: ConnectorEvent) -> SyncResult:
         job_id=job_id,
         version=version,
         source_uri=source_uri,
+        document_status=pipeline.status if pipeline else None,
+        chunks_created=pipeline.chunks_created if pipeline else None,
+        chunks_skipped=pipeline.chunks_skipped if pipeline else None,
+        pipeline_error=pipeline.error_message if pipeline else None,
+        stage_failed=pipeline.stage_failed if pipeline else None,
     )
 
 
