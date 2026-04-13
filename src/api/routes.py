@@ -75,6 +75,22 @@ async def create_scope(body: CreateScopeRequest) -> dict:
         _db_unavailable(exc)
 
 
+@router.post("/scopes/{scope:path}/invalidate-documents", status_code=200)
+async def invalidate_scope_documents(scope: str) -> dict:
+    """Mark all active document rows in a scope as 'cleared'.
+
+    Called after clear-index to invalidate dedup state so the next upload
+    of the same file content is treated as a fresh ingest, not skipped.
+    Idempotent: safe to call even if no active documents exist.
+    """
+    try:
+        count = registry.invalidate_active_documents(scope)
+        logger.info("invalidate_documents: scope=%s cleared=%d", scope, count)
+        return {"scope": scope, "invalidated": count}
+    except RuntimeError as exc:
+        _db_unavailable(exc)
+
+
 # ── Upload ────────────────────────────────────────────────────────────────────
 
 

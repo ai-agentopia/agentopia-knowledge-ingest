@@ -300,6 +300,27 @@ def update_document_status(
         )
 
 
+def invalidate_active_documents(scope: str) -> int:
+    """Mark all active document rows in a scope as 'cleared'.
+
+    Used after clear-index to invalidate dedup state: the next upload of
+    the same file content will be treated as a fresh ingest (fetched_new)
+    rather than skipped_unchanged.
+
+    Returns the number of rows invalidated.
+    """
+    with transaction() as cur:
+        cur.execute(
+            """
+            UPDATE documents
+            SET    status = 'cleared', updated_at = NOW()
+            WHERE  scope = %s AND status = 'active'
+            """,
+            (scope,),
+        )
+        return cur.rowcount
+
+
 def promote_to_active(row_id: int, document_id: str) -> int | None:
     """Atomically promote a document version to active and supersede the prior active row.
 
