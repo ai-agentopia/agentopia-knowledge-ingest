@@ -619,6 +619,37 @@ class TestConnectorAdapterStubbed(unittest.TestCase):
         self.assertIsNone(r2.document_status)
         self.assertIsNone(r2.chunks_created)
 
+    # ── Dedup after clear-index ──────────────────────────────────────────────
+
+    def test_cleared_status_does_not_cause_skipped_unchanged(self):
+        """After clear-index invalidates active→cleared, same-hash re-upload must reindex."""
+        reg, sync = self._reg_sync()
+        raw = b"# Content\n"
+        r1, _ = _run_stubbed(_make_event(raw_bytes=raw), reg, sync)
+        doc_row = next(r for r in reg._rows if r["document_id"] == r1.document_id)
+        doc_row["status"] = "active"
+
+        # Simulate clear-index invalidation: status changed to 'cleared'
+        doc_row["status"] = "cleared"
+
+        # Re-upload the same content
+        r2, _ = _run_stubbed(_make_event(raw_bytes=raw), reg, sync)
+        self.assertEqual(r2.verdict, "fetched_new",
+                         "After clear-index, same content must be fetched_new, not skipped_unchanged")
+        self.assertIsNotNone(r2.document_id)
+        self.assertIsNotNone(r2.job_id)
+
+    def test_active_with_same_hash_still_skips(self):
+        """Active document with same hash is correctly skipped (baseline control)."""
+        reg, sync = self._reg_sync()
+        raw = b"# Content\n"
+        r1, _ = _run_stubbed(_make_event(raw_bytes=raw), reg, sync)
+        next(r for r in reg._rows if r["document_id"] == r1.document_id)["status"] = "active"
+
+        r2, _ = _run_stubbed(_make_event(raw_bytes=raw), reg, sync)
+        self.assertEqual(r2.verdict, "skipped_unchanged",
+                         "Active document with same hash must still be skipped")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TestConnectorAdapterRealPipeline: real normalizer + extractor + orchestrator
