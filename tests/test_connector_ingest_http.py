@@ -63,6 +63,12 @@ class _SyncResult:
     job_id: Optional[str] = None
     version: Optional[int] = None
     error_message: Optional[str] = None
+    source_uri: str = ""
+    document_status: Optional[str] = None
+    chunks_created: Optional[int] = None
+    chunks_skipped: Optional[int] = None
+    pipeline_error: Optional[str] = None
+    stage_failed: Optional[str] = None
 
 
 def _b64(data: bytes) -> str:

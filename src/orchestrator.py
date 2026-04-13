@@ -15,6 +15,7 @@ No external API changes. No state machine changes.
 import json
 import logging
 import time
+from dataclasses import dataclass
 
 import httpx
 
@@ -23,6 +24,21 @@ from db import registry
 from normalizer.base import NormalizationError, detect_format, normalize
 from normalizer.extractor import ExtractedMetadata, extract
 from storage import store
+
+
+@dataclass
+class PipelineResult:
+    """Outcome of a synchronous ingest pipeline run.
+
+    Returned by run_pipeline() so callers can surface the actual ingest
+    outcome — not just the connector sync verdict.
+    """
+
+    status: str  # "active" | "failed"
+    chunks_created: int = 0
+    chunks_skipped: int = 0
+    error_message: str | None = None
+    stage_failed: str | None = None  # "normalization" | "extraction_storage" | "indexing" | "promotion"
 
 logger = logging.getLogger(__name__)
 
@@ -38,13 +54,15 @@ def run_pipeline(
     raw_bytes: bytes,
     s3_original_key: str,
     actor: str = "",
-) -> None:
+) -> PipelineResult:
     """Execute the full synchronous ingest pipeline for one document version.
 
     Uses row_id (surrogate PK) to target the exact document version throughout.
     State transitions: submitted → normalizing → normalized → extracting →
                       extracted → indexing → active
                    OR any stage → failed (prior active version of this document untouched)
+
+    Returns PipelineResult with the final status, chunk counts, and error details.
     """
     settings = get_settings()
     fmt = detect_format(filename)
@@ -55,11 +73,11 @@ def run_pipeline(
         normalized = normalize(raw_bytes, fmt)
     except (NormalizationError, ValueError) as exc:
         _fail(job_id, row_id, document_id, version, scope, str(exc), actor=actor)
-        return
+        return PipelineResult(status="failed", error_message=str(exc), stage_failed="normalization")
     except Exception as exc:
-        _fail(job_id, row_id, document_id, version, scope,
-              f"Unexpected normalization error: {exc}", actor=actor)
-        return
+        msg = f"Unexpected normalization error: {exc}"
+        _fail(job_id, row_id, document_id, version, scope, msg, actor=actor)
+        return PipelineResult(status="failed", error_message=msg, stage_failed="normalization")
 
     norm_bytes = json.dumps(
         normalized.to_json_dict(document_id, version, fmt)
@@ -67,9 +85,9 @@ def run_pipeline(
     try:
         s3_normalized_key = store.write_normalized(scope, document_id, version, norm_bytes)
     except Exception as exc:
-        _fail(job_id, row_id, document_id, version, scope,
-              f"Storage write failed (normalized): {exc}", actor=actor)
-        return
+        msg = f"Storage write failed (normalized): {exc}"
+        _fail(job_id, row_id, document_id, version, scope, msg, actor=actor)
+        return PipelineResult(status="failed", error_message=msg, stage_failed="normalization")
 
     _transition(job_id, row_id, document_id, version, scope, "normalized", 40,
                 s3_normalized_key=s3_normalized_key, actor=actor)
@@ -93,9 +111,9 @@ def run_pipeline(
     try:
         s3_extracted_key = store.write_extracted(scope, document_id, version, ext_bytes)
     except Exception as exc:
-        _fail(job_id, row_id, document_id, version, scope,
-              f"Storage write failed (extracted): {exc}", actor=actor)
-        return
+        msg = f"Storage write failed (extracted): {exc}"
+        _fail(job_id, row_id, document_id, version, scope, msg, actor=actor)
+        return PipelineResult(status="failed", error_message=msg, stage_failed="extraction_storage")
 
     _transition(job_id, row_id, document_id, version, scope, "extracted", 60,
                 s3_extracted_key=s3_extracted_key, actor=actor)
@@ -157,12 +175,9 @@ def run_pipeline(
                 time.sleep(sleep_secs)
 
     if last_exc is not None:
-        _fail(
-            job_id, row_id, document_id, version, scope,
-            f"Super RAG ingest failed after {max_retries} retries: {last_exc}",
-            actor=actor,
-        )
-        return
+        msg = f"Super RAG ingest failed after {max_retries} retries: {last_exc}"
+        _fail(job_id, row_id, document_id, version, scope, msg, actor=actor)
+        return PipelineResult(status="failed", error_message=msg, stage_failed="indexing")
 
     # ── Stage 4: Promote to active (atomic swap with prior active version) ────
     # promote_to_active() supersedes the prior active row and sets this row to
@@ -170,6 +185,18 @@ def run_pipeline(
     # idx_documents_one_active (only one active per document_id at any time).
     # Plain update_document_status(row_id, "active") is NOT used here because
     # it would violate the constraint when a prior active version exists.
+    # Parse chunk counts from the Super RAG response
+    chunks_created = 0
+    chunks_skipped = 0
+    try:
+        rag_data = resp.json()
+        chunks_created = rag_data.get("chunk_count", 0)
+        if rag_data.get("status") == "skipped":
+            chunks_skipped = chunks_created
+            chunks_created = 0
+    except Exception:
+        pass
+
     try:
         superseded_row_id = registry.promote_to_active(row_id, document_id)
         registry.update_job(job_id, status="active", stage="active",
@@ -185,13 +212,17 @@ def run_pipeline(
             metadata={"format": fmt, "superseded_row_id": superseded_row_id},
         )
         logger.info(
-            "orchestrator: doc=%s v%d active scope=%s superseded_row=%s",
-            document_id, version, scope, superseded_row_id,
+            "orchestrator: doc=%s v%d active scope=%s superseded_row=%s chunks=%d",
+            document_id, version, scope, superseded_row_id, chunks_created,
         )
     except Exception as exc:
         logger.error("orchestrator: failed to promote active doc=%s v%d: %s", document_id, version, exc)
-        _fail(job_id, row_id, document_id, version, scope,
-              f"Failed to promote to active: {exc}", actor=actor)
+        msg = f"Failed to promote to active: {exc}"
+        _fail(job_id, row_id, document_id, version, scope, msg, actor=actor)
+        return PipelineResult(status="failed", error_message=msg, stage_failed="promotion",
+                              chunks_created=chunks_created, chunks_skipped=chunks_skipped)
+
+    return PipelineResult(status="active", chunks_created=chunks_created, chunks_skipped=chunks_skipped)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

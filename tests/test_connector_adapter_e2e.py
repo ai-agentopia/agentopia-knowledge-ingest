@@ -274,11 +274,14 @@ def _make_event(
     )
 
 
-def _run_stubbed(event, reg, sync, *, orchestrator_raises=None, resolved_scope=None):
+def _run_stubbed(event, reg, sync, *, orchestrator_raises=None, resolved_scope=None, pipeline_result=None):
     """Run ingest_from_connector with all DB stubs, orchestrator stubbed."""
     from connectors import adapter as _mod
+    from orchestrator import PipelineResult
 
-    pipeline_mock = MagicMock(return_value=None)
+    if pipeline_result is None:
+        pipeline_result = PipelineResult(status="active", chunks_created=5)
+    pipeline_mock = MagicMock(return_value=pipeline_result)
     if orchestrator_raises is not None:
         pipeline_mock.side_effect = orchestrator_raises
 
@@ -560,6 +563,61 @@ class TestConnectorAdapterStubbed(unittest.TestCase):
         self.assertEqual(result.verdict, "fetch_failed")
         task = sync.get_task(result.task_id)
         self.assertIsNotNone(task["completed_at"])
+
+    # ── Pipeline result propagation ──────────────────────────────────────────
+
+    def test_pipeline_result_propagated_to_sync_result(self):
+        """SyncResult must carry document_status and chunks from pipeline."""
+        from orchestrator import PipelineResult
+        reg, sync = self._reg_sync()
+        pr = PipelineResult(status="active", chunks_created=12, chunks_skipped=0)
+        result, _ = _run_stubbed(_make_event(), reg, sync, pipeline_result=pr)
+        self.assertEqual(result.verdict, "fetched_new")
+        self.assertEqual(result.document_status, "active")
+        self.assertEqual(result.chunks_created, 12)
+        self.assertEqual(result.chunks_skipped, 0)
+        self.assertIsNone(result.pipeline_error)
+        self.assertIsNone(result.stage_failed)
+
+    def test_pipeline_failure_propagated_to_sync_result(self):
+        """Pipeline failure must surface document_status=failed and error details."""
+        from orchestrator import PipelineResult
+        reg, sync = self._reg_sync()
+        pr = PipelineResult(status="failed", error_message="parse error", stage_failed="normalization")
+        result, _ = _run_stubbed(_make_event(), reg, sync, pipeline_result=pr)
+        self.assertEqual(result.verdict, "fetched_new")  # sync verdict unchanged
+        self.assertEqual(result.document_status, "failed")
+        self.assertEqual(result.pipeline_error, "parse error")
+        self.assertEqual(result.stage_failed, "normalization")
+
+    def test_orchestrator_exception_sets_failed_pipeline_result(self):
+        """Unhandled orchestrator exception must produce document_status=failed."""
+        reg, sync = self._reg_sync()
+        result, _ = _run_stubbed(_make_event(), reg, sync,
+                                 orchestrator_raises=RuntimeError("boom"))
+        self.assertEqual(result.verdict, "fetched_new")
+        self.assertEqual(result.document_status, "failed")
+        self.assertIn("boom", result.pipeline_error or "")
+
+    def test_fetch_failed_has_no_pipeline_fields(self):
+        """fetch_failed verdict should have no pipeline outcome fields."""
+        _, sync = self._reg_sync()
+        reg = _InMemoryRegistry(known_scopes={"registered/scope"})
+        result, _ = _run_stubbed(_make_event(scope="bad/scope"), reg, sync)
+        self.assertEqual(result.verdict, "fetch_failed")
+        self.assertIsNone(result.document_status)
+        self.assertIsNone(result.chunks_created)
+
+    def test_skipped_unchanged_has_no_pipeline_fields(self):
+        """skipped_unchanged should have no pipeline outcome fields."""
+        reg, sync = self._reg_sync()
+        raw = b"# Stable\n"
+        r1, _ = _run_stubbed(_make_event(raw_bytes=raw), reg, sync)
+        next(r for r in reg._rows if r["document_id"] == r1.document_id)["status"] = "active"
+        r2, _ = _run_stubbed(_make_event(raw_bytes=raw), reg, sync)
+        self.assertEqual(r2.verdict, "skipped_unchanged")
+        self.assertIsNone(r2.document_status)
+        self.assertIsNone(r2.chunks_created)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
