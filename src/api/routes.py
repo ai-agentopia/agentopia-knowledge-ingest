@@ -75,6 +75,33 @@ async def create_scope(body: CreateScopeRequest) -> dict:
         _db_unavailable(exc)
 
 
+@router.patch("/scopes/{scope:path}/ingest-mode", status_code=200)
+async def set_scope_ingest_mode(scope: str, body: dict) -> dict:
+    """Set the ingest mode for a scope ('legacy' or 'pathway').
+
+    Called by bot-config-api when scope_ingest_mode changes in knowledge_bases.
+    Enforces the single-publisher invariant at the upload API boundary.
+
+    Once set to 'pathway', POST /documents/upload returns 409 Conflict for
+    this scope. Revert to 'legacy' to re-enable direct upload.
+    """
+    mode = body.get("scope_ingest_mode", "")
+    if mode not in ("legacy", "pathway"):
+        raise HTTPException(
+            status_code=422,
+            detail="scope_ingest_mode must be 'legacy' or 'pathway'",
+        )
+    try:
+        registry.set_scope_ingest_mode(scope, mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except RuntimeError as exc:
+        _db_unavailable(exc)
+
+    logger.info("scope_ingest_mode: scope=%s mode=%s", scope, mode)
+    return {"scope": scope, "scope_ingest_mode": mode}
+
+
 @router.post("/scopes/{scope:path}/invalidate-documents", status_code=200)
 async def invalidate_scope_documents(scope: str) -> dict:
     """Mark all active document rows in a scope as 'cleared'.
@@ -115,6 +142,17 @@ async def upload_document(
         raise
     except RuntimeError as exc:
         _db_unavailable(exc)
+
+    # Single-publisher guard (P3.2): if scope is pathway-managed, reject direct uploads
+    try:
+        ingest_mode = registry.get_scope_ingest_mode(scope)
+    except RuntimeError as exc:
+        _db_unavailable(exc)
+    if ingest_mode == "pathway":
+        raise HTTPException(
+            status_code=409,
+            detail="scope is managed by Pathway; use S3 upload path",
+        )
 
     raw_bytes = await file.read()
     if not raw_bytes:

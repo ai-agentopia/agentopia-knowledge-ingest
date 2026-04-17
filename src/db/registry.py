@@ -173,16 +173,60 @@ def create_scope(scope_name: str, description: str = "", owner: str = "") -> dic
         }
 
 
+def get_scope_ingest_mode(scope_name: str) -> str:
+    """Return the scope_ingest_mode for scope_name ('legacy' or 'pathway').
+
+    Returns 'legacy' if the scope does not exist or the column is NULL
+    (backward-compatible — unregistered scopes default to legacy path).
+    """
+    with transaction() as cur:
+        cur.execute(
+            "SELECT scope_ingest_mode FROM scopes WHERE scope_name = %s LIMIT 1",
+            (scope_name,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return "legacy"
+        return row[0] or "legacy"
+
+
+def set_scope_ingest_mode(scope_name: str, mode: str) -> None:
+    """Set the ingest mode for an existing scope.
+
+    Args:
+        scope_name: registered scope identity (e.g. 'joblogic-kb/api-docs')
+        mode: 'legacy' or 'pathway'
+
+    Raises:
+        ValueError: if mode is not 'legacy' or 'pathway', or scope does not exist
+    """
+    if mode not in ("legacy", "pathway"):
+        raise ValueError(f"Invalid scope_ingest_mode '{mode}': must be 'legacy' or 'pathway'")
+    with transaction() as cur:
+        cur.execute(
+            """
+            UPDATE scopes SET scope_ingest_mode = %s
+            WHERE scope_name = %s
+            RETURNING scope_name
+            """,
+            (mode, scope_name),
+        )
+        if cur.fetchone() is None:
+            raise ValueError(f"Scope '{scope_name}' not found")
+
+
 def list_scopes() -> list[dict]:
     """Return all registered scopes with active document counts."""
     with transaction() as cur:
         cur.execute(
             """
             SELECT s.scope_id, s.scope_name, s.description, s.owner, s.created_at,
+                   s.scope_ingest_mode,
                    COUNT(DISTINCT d.document_id) AS document_count
             FROM scopes s
             LEFT JOIN documents d ON d.scope = s.scope_name AND d.status = 'active'
-            GROUP BY s.scope_id, s.scope_name, s.description, s.owner, s.created_at
+            GROUP BY s.scope_id, s.scope_name, s.description, s.owner, s.created_at,
+                     s.scope_ingest_mode
             ORDER BY s.scope_name
             """,
         )
@@ -193,7 +237,8 @@ def list_scopes() -> list[dict]:
                 "description": r[2],
                 "owner": r[3],
                 "created_at": r[4].isoformat(),
-                "document_count": r[5],
+                "scope_ingest_mode": r[5],
+                "document_count": r[6],
             }
             for r in cur.fetchall()
         ]
