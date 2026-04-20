@@ -1,5 +1,11 @@
 """W-C2.1: AWS S3 connector wrapper — bridges S3Connector into ingest_from_connector().
 
+DEPRECATED 2026-04-20 — superseded by ADR-001 `external_s3` source kind.
+The correct migration path for S3-backed corpora is to register an `external_s3`
+source row via `POST /api/v1/knowledge/{scope}/sources` (bot-config-api).
+Pathway then watches the bucket/prefix directly — no connector sync loop required.
+This module remains for reference; do not add new callers.
+
 Issue:  knowledge-ingest#37
 ADR:    docs/adr/002-connector-precondition-audit.md (GATE-1)
 Source: langflow-ai/openrag src/connectors/aws_s3/connector.py (see openrag_s3.py)
