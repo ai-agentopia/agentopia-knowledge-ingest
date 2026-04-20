@@ -39,12 +39,63 @@ from unittest.mock import AsyncMock, MagicMock, patch, call
 
 import pytest
 
+import sys, types
+
+# ---------------------------------------------------------------------------
+# Synthetic shims — allow import without real Google or boto3 libraries
+# ---------------------------------------------------------------------------
+
+_fake_boto3 = types.ModuleType("boto3")
+_fake_boto3.client = lambda service, **kwargs: MagicMock()
+sys.modules.setdefault("boto3", _fake_boto3)
+
+def _fake_module(name: str) -> types.ModuleType:
+    m = types.ModuleType(name)
+    sys.modules[name] = m
+    return m
+
+# googleapiclient.*
+_gapi = _fake_module("googleapiclient")
+_gapi_disc = _fake_module("googleapiclient.discovery")
+_gapi_disc.build = MagicMock(return_value=MagicMock())
+_gapi_err = _fake_module("googleapiclient.errors")
+_gapi_err.HttpError = type("HttpError", (Exception,), {})
+_gapi_http = _fake_module("googleapiclient.http")
+_gapi_http.MediaIoBaseDownload = MagicMock()
+
+# google.*
+_google = _fake_module("google")
+_google_auth = _fake_module("google.auth")
+_google_auth_tr = _fake_module("google.auth.transport")
+_google_auth_req = _fake_module("google.auth.transport.requests")
+_google_auth_req.Request = MagicMock()
+_google_oauth2 = _fake_module("google.oauth2")
+_google_oauth2_creds = _fake_module("google.oauth2.credentials")
+class _FakeCredentials:
+    def __init__(self, **kwargs):
+        self.token = kwargs.get("token")
+        self.refresh_token = kwargs.get("refresh_token")
+        self.scopes = kwargs.get("scopes")
+        self.expiry = kwargs.get("expiry")
+        self.expired = False
+        self.valid = True
+    def refresh(self, request):
+        pass
+_google_oauth2_creds.Credentials = _FakeCredentials
+
 from connectors.adapter import ConnectorEvent, SyncResult
 from connectors.google_drive_wrapper import (
     CONNECTOR_MODULE,
     _infer_format,
     derive_source_uri,
     sync_gdrive,
+    sync_gdrive_relay,
+)
+from connectors.managed_relay import (
+    ConnectorFile,
+    ManagedSourceRef,
+    RelayError,
+    RelayResult,
 )
 from connectors.openrag_base import ConnectorDocument
 
@@ -711,3 +762,191 @@ class TestMultipleFiles:
 
         mock_ingest.assert_not_called()
         assert results == []
+
+
+# ---------------------------------------------------------------------------
+# sync_gdrive_relay — relay mode tests
+# ---------------------------------------------------------------------------
+
+def _source_ref(**overrides) -> ManagedSourceRef:
+    defaults = dict(
+        source_id="00000000-0000-0000-0000-000000000099",
+        bucket="agentopia-knowledge-dev",
+        prefix="scopes/scope-1/sources/src-1/",
+        region="ap-northeast-1",
+        access_key="AKIATEST",
+        secret_key="testsecret",
+        endpoint_url=None,
+    )
+    defaults.update(overrides)
+    return ManagedSourceRef(**defaults)
+
+
+def _ok_relay_result(file_id: str, filename: str = "api-reference.pdf") -> RelayResult:
+    return RelayResult(
+        connector_module=CONNECTOR_MODULE,
+        stable_id=file_id,
+        filename=filename,
+        s3_key=f"scopes/scope-1/sources/src-1/google_drive/{file_id}.pdf",
+        bytes_written=21,
+        etag="etag001",
+        replaced=False,
+    )
+
+
+class TestSyncGdriveRelay:
+    """Tests for sync_gdrive_relay — the production relay-mode entry point."""
+
+    @pytest.mark.asyncio
+    async def test_relay_mode_calls_relay_files_not_ingest(self):
+        """relay_files() is called; ingest_from_connector() is NOT called."""
+        connector = _connector_mock()
+        ref = _source_ref()
+        expected_results = [_ok_relay_result(_FILE_ID_1)]
+
+        with patch(f"{_MOD}.GoogleDriveConnector", return_value=connector):
+            with patch(f"{_MOD}.relay_files", return_value=(expected_results, [])) as mock_relay:
+                with patch(f"{_MOD}.ingest_from_connector") as mock_ingest:
+                    results, errors = await sync_gdrive_relay(_BASE_CONFIG, ref)
+
+        mock_relay.assert_called_once()
+        mock_ingest.assert_not_called()
+        assert len(results) == 1
+        assert len(errors) == 0
+
+    @pytest.mark.asyncio
+    async def test_relay_uses_file_id_as_stable_id(self):
+        """ConnectorFile.stable_id == Drive fileId (NOT filename)."""
+        connector = _connector_mock(
+            files=[_make_file_meta(file_id=_FILE_ID_1, name="report.pdf")],
+            doc=_make_doc(file_id=_FILE_ID_1, filename="report.pdf"),
+        )
+        ref = _source_ref()
+        captured: list[ConnectorFile] = []
+
+        def capture_relay(r, files):
+            captured.extend(files)
+            return [_ok_relay_result(_FILE_ID_1, "report.pdf")], []
+
+        with patch(f"{_MOD}.GoogleDriveConnector", return_value=connector):
+            with patch(f"{_MOD}.relay_files", side_effect=capture_relay):
+                await sync_gdrive_relay(_BASE_CONFIG, ref)
+
+        assert len(captured) == 1
+        assert captured[0].stable_id == _FILE_ID_1  # stable_id = fileId, NOT filename
+        assert captured[0].connector_module == CONNECTOR_MODULE
+        assert captured[0].filename == "report.pdf"
+
+    @pytest.mark.asyncio
+    async def test_two_files_same_basename_different_ids_no_collision(self):
+        """Files with same display name in different Drive folders → different stable_ids."""
+        files_meta = [
+            _make_file_meta(file_id=_FILE_ID_1, name="report.pdf"),
+            _make_file_meta(file_id=_FILE_ID_2, name="report.pdf"),  # same basename!
+        ]
+        connector = _connector_mock(files=files_meta)
+        connector.get_file_content = AsyncMock(side_effect=[
+            _make_doc(file_id=_FILE_ID_1, filename="report.pdf"),
+            _make_doc(file_id=_FILE_ID_2, filename="report.pdf"),
+        ])
+        ref = _source_ref()
+        captured: list[ConnectorFile] = []
+
+        def capture_relay(r, files):
+            captured.extend(files)
+            return [
+                _ok_relay_result(_FILE_ID_1, "report.pdf"),
+                _ok_relay_result(_FILE_ID_2, "report.pdf"),
+            ], []
+
+        with patch(f"{_MOD}.GoogleDriveConnector", return_value=connector):
+            with patch(f"{_MOD}.relay_files", side_effect=capture_relay):
+                results, errors = await sync_gdrive_relay(_BASE_CONFIG, ref)
+
+        assert len(captured) == 2
+        # Different stable_ids → no collision
+        assert captured[0].stable_id != captured[1].stable_id
+        assert captured[0].stable_id == _FILE_ID_1
+        assert captured[1].stable_id == _FILE_ID_2
+
+    @pytest.mark.asyncio
+    async def test_relay_auth_failure_raises_runtime_error(self):
+        connector = _connector_mock(auth_return=False)
+        ref = _source_ref()
+        with patch(f"{_MOD}.GoogleDriveConnector", return_value=connector):
+            with pytest.raises(RuntimeError, match="authentication failed"):
+                await sync_gdrive_relay(_BASE_CONFIG, ref)
+
+    @pytest.mark.asyncio
+    async def test_relay_unsupported_mime_skipped(self):
+        """Google Sheets files are skipped before content download in relay mode too."""
+        files_meta = [
+            _make_file_meta(file_id=_FILE_ID_1, mime_type="application/vnd.google-apps.spreadsheet"),
+        ]
+        connector = _connector_mock(files=files_meta)
+        ref = _source_ref()
+        captured: list[ConnectorFile] = []
+
+        def capture_relay(r, files):
+            captured.extend(files)
+            return [], []
+
+        with patch(f"{_MOD}.GoogleDriveConnector", return_value=connector):
+            with patch(f"{_MOD}.relay_files", side_effect=capture_relay):
+                results, errors = await sync_gdrive_relay(_BASE_CONFIG, ref)
+
+        # Skipped before relay_files — no ConnectorFile constructed for this file
+        assert len(captured) == 0
+        connector.get_file_content.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_relay_content_fetch_error_skipped(self):
+        """fetch failure on one file → that file skipped, others continue."""
+        files_meta = [
+            _make_file_meta(file_id=_FILE_ID_1, name="ok.pdf"),
+            _make_file_meta(file_id=_FILE_ID_2, name="bad.pdf"),
+        ]
+        connector = _connector_mock(files=files_meta)
+        connector.get_file_content = AsyncMock(side_effect=[
+            _make_doc(file_id=_FILE_ID_1, filename="ok.pdf"),
+            Exception("network error"),
+        ])
+        ref = _source_ref()
+        captured: list[ConnectorFile] = []
+
+        def capture_relay(r, files):
+            captured.extend(files)
+            return [_ok_relay_result(_FILE_ID_1, "ok.pdf")], []
+
+        with patch(f"{_MOD}.GoogleDriveConnector", return_value=connector):
+            with patch(f"{_MOD}.relay_files", side_effect=capture_relay):
+                results, errors = await sync_gdrive_relay(_BASE_CONFIG, ref)
+
+        # Only the successful file was relayed
+        assert len(captured) == 1
+        assert captured[0].stable_id == _FILE_ID_1
+
+    @pytest.mark.asyncio
+    async def test_relay_missing_credentials_raises_value_error(self):
+        ref = _source_ref()
+        bad_config = {"token_file": "/tmp/tok.json"}  # no client_id / client_secret
+        with pytest.raises(ValueError, match="client_id"):
+            await sync_gdrive_relay(bad_config, ref)
+
+    @pytest.mark.asyncio
+    async def test_relay_passes_source_ref_to_relay_files(self):
+        """The ManagedSourceRef passed by caller is forwarded to relay_files() unchanged."""
+        connector = _connector_mock()
+        ref = _source_ref(source_id="specific-uuid")
+        captured_ref = []
+
+        def capture_relay(r, files):
+            captured_ref.append(r)
+            return [_ok_relay_result(_FILE_ID_1)], []
+
+        with patch(f"{_MOD}.GoogleDriveConnector", return_value=connector):
+            with patch(f"{_MOD}.relay_files", side_effect=capture_relay):
+                await sync_gdrive_relay(_BASE_CONFIG, ref)
+
+        assert len(captured_ref) == 1
+        assert captured_ref[0].source_id == "specific-uuid"

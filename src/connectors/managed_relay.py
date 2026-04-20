@@ -1,29 +1,46 @@
 """Managed-prefix relay — write connector files directly to a managed S3 prefix.
 
-Migration path for push-based connectors (Google Drive, OneDrive) under ADR-001.
+Push-source connector workflow for Google Drive, OneDrive, and similar sources
+under ADR-001. Implements the managed-upload relay pattern.
 
 Architecture
 ------------
-Under ADR-001, all ingest must converge on object storage → Pathway → Qdrant.
-For connectors that cannot expose an S3-compatible endpoint (GDrive, OneDrive),
-the relay pattern puts connector-fetched bytes into the scope's `managed_upload`
-source prefix. Pathway's existing S3 watcher picks up the new objects
-automatically — no Pathway restart, no second ingest pipeline.
+Push-based connectors cannot expose an S3-compatible endpoint. Under ADR-001
+these connectors write fetched bytes into the scope's `managed_upload` source
+prefix. Pathway's existing S3 watcher picks up the objects automatically —
+no Pathway restart, no separate pipeline.
 
               connector fetch
          (google_drive / onedrive)
                     │
                     ▼
-           managed_relay.put()
+           managed_relay.relay_files()
                     │
                     ▼
-       S3: {bucket}/{prefix}{filename}
+       S3: {prefix}{connector_module}/{safe_stable_id(stable_id)}{ext}
                     │
                     ▼
          Pathway pw.io.s3.read()  (existing watcher)
                     │
                     ▼
                  Qdrant
+
+S3 object identity contract
+----------------------------
+Key = `{prefix}{connector_module}/{safe_stable_id(stable_id)}{ext}`
+
+  prefix           – from ManagedSourceRef (e.g. "scopes/{scope_id}/sources/{src_id}/")
+  connector_module – "google_drive", "onedrive", "aws_s3", etc.
+  stable_id        – the connector's own stable item identifier (NOT the filename):
+                       • Google Drive: fileId (opaque, stable across renames)
+                       • OneDrive:     itemId (stable within a drive)
+                     The stable_id is sanitised via safe_stable_id() before use.
+  ext              – extension derived from the display filename (".pdf", ".docx", ...)
+
+Why NOT basename:
+  Two files named "report.pdf" in different Drive folders have different fileIds
+  but the same basename → basename-only identity causes silent overwrite/delete.
+  stable_id-based identity prevents all such collisions.
 
 Calling convention
 ------------------
@@ -36,20 +53,8 @@ The relay does NOT:
   - Track per-file dedup state (Pathway handles idempotent re-ingest via ETag).
   - Accept credentials as positional arguments.
   - Log secret values at any log level.
-
-S3 key contract
----------------
-  key = prefix + safe_filename(filename)
-
-`safe_filename()` strips path components and replaces non-safe characters with `_`
-so that connector-sourced filenames cannot traverse the prefix boundary.
-
-If the same filename is uploaded again with different content, S3 PutObject
-replaces the existing object. Pathway detects the ETag change and re-ingests.
-Unchanged content produces the same ETag — Pathway skips (idempotent).
 """
 
-import hashlib
 import logging
 import re
 from dataclasses import dataclass
@@ -70,19 +75,78 @@ class ManagedSourceRef:
     Credentials come separately from Vault (never embedded in storage_ref).
     """
 
-    source_id: str        # UUID from knowledge_sources.source_id
-    bucket: str           # S3 bucket (Agentopia-managed, one per env)
-    prefix: str           # S3 key prefix: "scopes/{scope_id}/sources/{source_id}/"
-    region: str           # AWS region
-    access_key: str       # Injected from Vault / K8s secret at call time
-    secret_key: str       # Injected from Vault / K8s secret at call time
+    source_id: str               # UUID from knowledge_sources.source_id
+    bucket: str                  # S3 bucket (Agentopia-managed, one per env)
+    prefix: str                  # Key prefix: "scopes/{scope_id}/sources/{source_id}/"
+    region: str                  # AWS region
+    access_key: str              # Injected from Vault / K8s secret at call time
+    secret_key: str              # Injected from Vault / K8s secret at call time
     endpoint_url: Optional[str] = None  # Non-None for MinIO / S3-compatible
+
+    @classmethod
+    def from_source_row(
+        cls,
+        source_id: str,
+        storage_ref: dict,
+        access_key: str,
+        secret_key: str,
+        endpoint_url: Optional[str] = None,
+    ) -> "ManagedSourceRef":
+        """Construct from a knowledge_sources row's storage_ref JSONB.
+
+        Args:
+            source_id:   knowledge_sources.source_id (UUID string)
+            storage_ref: Parsed storage_ref dict {"bucket", "prefix", "region"}
+            access_key:  S3 access key — from Vault or K8s Secret at call time
+            secret_key:  S3 secret key — from Vault or K8s Secret at call time
+            endpoint_url: Optional S3-compatible endpoint override
+        """
+        return cls(
+            source_id=source_id,
+            bucket=storage_ref["bucket"],
+            prefix=storage_ref.get("prefix", ""),
+            region=storage_ref["region"],
+            access_key=access_key,
+            secret_key=secret_key,
+            endpoint_url=endpoint_url,
+        )
+
+
+@dataclass
+class ConnectorFile:
+    """A file from a push-based connector, ready to relay to managed S3 prefix.
+
+    Identity is carried by (connector_module, stable_id), NOT by filename.
+    filename is used only for extension extraction.
+
+    Attributes:
+        connector_module: Connector identifier — "google_drive", "onedrive", etc.
+                          Used as a sub-folder in the S3 key to namespace by source.
+        stable_id:        The connector's native stable identifier for this item.
+                          Must be stable across file renames, folder moves, and
+                          repeated sync runs. Examples:
+                            - Google Drive: fileId (opaque, Drive-assigned)
+                            - OneDrive: itemId (stable within a drive)
+                          Do NOT use the filename or display path as stable_id.
+        filename:         Display filename from the connector. Used ONLY to derive
+                          the file extension for the S3 key. Not used for identity.
+        content:          Raw file bytes.
+        content_type:     MIME type (informational; stored as S3 ContentType).
+    """
+
+    connector_module: str
+    stable_id: str
+    filename: str
+    content: bytes
+    content_type: str = "application/octet-stream"
 
 
 @dataclass
 class RelayResult:
-    """Result for one file relayed to the managed prefix."""
+    """Result for one file successfully relayed to the managed prefix."""
 
+    connector_module: str
+    stable_id: str
     filename: str
     s3_key: str
     bytes_written: int
@@ -92,36 +156,79 @@ class RelayResult:
 
 @dataclass
 class RelayError:
-    """Per-file error record when relay fails for one file."""
+    """Per-file error when relay fails."""
 
+    connector_module: str
+    stable_id: str
     filename: str
     error: str
 
 
 # ---------------------------------------------------------------------------
-# Filename safety
+# Key identity helpers
 # ---------------------------------------------------------------------------
 
-_UNSAFE = re.compile(r"[^\w.\-]")
+_STABLE_ID_UNSAFE = re.compile(r"[^\w\-]")
 
 
-def safe_filename(filename: str) -> str:
-    """Sanitize a connector-sourced filename for use as an S3 key suffix.
+def safe_stable_id(stable_id: str) -> str:
+    """Sanitise a connector stable ID for use as an S3 key segment.
 
-    Strips all path components (preserves only the basename), then replaces
-    any character that is not alphanumeric, dot, hyphen, or underscore with
-    an underscore. Empty names map to "_unnamed".
+    Replaces every character that is not alphanumeric, hyphen, or underscore
+    with an underscore. Produces a deterministic 1-to-1 mapping — the same
+    input always produces the same output, and different inputs produce different
+    outputs (no collapsing of consecutive unsafe chars, preserving injectivity).
+
+    Empty stable_id maps to "_empty".
 
     Examples:
-        "report.pdf"         → "report.pdf"
-        "my doc (v2).docx"   → "my_doc__v2_.docx"
-        "../../../etc/passwd" → "passwd"
-        ""                   → "_unnamed"
+        "1BxiMVs0XRA5nFMdK"           → "1BxiMVs0XRA5nFMdK"  (GDrive fileId, unchanged)
+        "driveId123/itemId456"          → "driveId123_itemId456"
+        "onedrive://driveId/itemId"     → "onedrive___driveId_itemId"
+        "item with spaces"              → "item_with_spaces"
+        ""                             → "_empty"
     """
-    # Strip path components — only keep the last segment
-    name = filename.replace("\\", "/").split("/")[-1]
-    name = _UNSAFE.sub("_", name)
-    return name or "_unnamed"
+    if not stable_id:
+        return "_empty"
+    return _STABLE_ID_UNSAFE.sub("_", stable_id)
+
+
+def _derive_ext(filename: str) -> str:
+    """Extract the lowercase file extension from a filename.
+
+    Returns the extension including the leading dot (e.g. ".pdf", ".docx").
+    Returns "" if the filename has no extension or is empty.
+
+    Examples:
+        "report.pdf"     → ".pdf"
+        "archive.tar.gz" → ".gz"
+        "README"         → ""
+        ""               → ""
+    """
+    if not filename or "." not in filename:
+        return ""
+    return "." + filename.rsplit(".", 1)[-1].lower()
+
+
+def object_key(ref: ManagedSourceRef, connector_module: str, stable_id: str, filename: str) -> str:
+    """Compute the canonical S3 key for a connector file.
+
+    Formula: {prefix}{connector_module}/{safe_stable_id(stable_id)}{ext}
+
+    This function is the single authoritative source of the key formula.
+    Both put_file() and delete_file() call this — guaranteeing that upload
+    and delete always reference the same key for the same logical item.
+
+    Args:
+        ref:              Target managed source ref (provides prefix).
+        connector_module: Connector identifier (namespaces keys per connector).
+        stable_id:        Connector's stable item identifier.
+        filename:         Display filename (extension extraction only).
+
+    Returns:
+        Full S3 key string.
+    """
+    return f"{ref.prefix}{connector_module}/{safe_stable_id(stable_id)}{_derive_ext(filename)}"
 
 
 # ---------------------------------------------------------------------------
@@ -148,37 +255,26 @@ def _build_s3_client(ref: ManagedSourceRef):
 # Core relay functions
 # ---------------------------------------------------------------------------
 
-def put_file(
-    ref: ManagedSourceRef,
-    filename: str,
-    content: bytes,
-    content_type: str = "application/octet-stream",
-) -> RelayResult:
-    """Write a single file into the managed S3 prefix.
+def put_file(ref: ManagedSourceRef, file: ConnectorFile) -> RelayResult:
+    """Write a single connector file into the managed S3 prefix.
 
-    The S3 key is `ref.prefix + safe_filename(filename)`. If an object at that
-    key already exists, it is replaced (S3 PutObject semantics). Pathway detects
-    ETag changes and re-ingests only when content differs.
+    The S3 key is derived from the file's connector_module + stable_id + extension.
+    If an object already exists at that key it is replaced (S3 PutObject semantics).
+    Pathway detects ETag changes and re-ingests; unchanged content is idempotent.
 
     Args:
-        ref:          ManagedSourceRef identifying the target source.
-        filename:     Original filename from the connector. Will be sanitized.
-        content:      Raw file bytes.
-        content_type: MIME type; stored as S3 ContentType metadata (informational).
+        ref:  ManagedSourceRef identifying the target source.
+        file: ConnectorFile carrying stable_id, filename, content, content_type.
 
     Returns:
-        RelayResult with s3_key, bytes_written, etag, and replaced flag.
+        RelayResult.
 
     Raises:
-        RuntimeError: On any S3 error. Caller should log and continue with
-                      remaining files rather than aborting the full sync.
+        RuntimeError: On S3 error. Callers should catch and continue with remaining files.
     """
-    s3_filename = safe_filename(filename)
-    key = ref.prefix + s3_filename
-
+    key = object_key(ref, file.connector_module, file.stable_id, file.filename)
     s3 = _build_s3_client(ref)
 
-    # Check if object already exists (to populate RelayResult.replaced)
     replaced = False
     try:
         s3.head_object(Bucket=ref.bucket, Key=key)
@@ -190,25 +286,30 @@ def put_file(
         response = s3.put_object(
             Bucket=ref.bucket,
             Key=key,
-            Body=content,
-            ContentType=content_type,
+            Body=file.content,
+            ContentType=file.content_type,
         )
     except Exception as exc:
         raise RuntimeError(
-            f"managed_relay: failed to write s3://{ref.bucket}/{key}: {type(exc).__name__}: {exc}"
+            f"managed_relay: PutObject failed s3://{ref.bucket}/{key}: "
+            f"{type(exc).__name__}: {exc}"
         ) from exc
 
     etag = (response.get("ETag") or "").strip('"')
 
     logger.info(
-        "managed_relay: put source_id=%s s3://%s/%s bytes=%d etag=%s replaced=%s",
-        ref.source_id, ref.bucket, key, len(content), etag, replaced,
+        "managed_relay: put source_id=%s connector=%s stable_id=%s "
+        "s3://%s/%s bytes=%d etag=%s replaced=%s",
+        ref.source_id, file.connector_module, file.stable_id,
+        ref.bucket, key, len(file.content), etag, replaced,
     )
 
     return RelayResult(
-        filename=filename,
+        connector_module=file.connector_module,
+        stable_id=file.stable_id,
+        filename=file.filename,
         s3_key=key,
-        bytes_written=len(content),
+        bytes_written=len(file.content),
         etag=etag,
         replaced=replaced,
     )
@@ -216,32 +317,38 @@ def put_file(
 
 def relay_files(
     ref: ManagedSourceRef,
-    files: list[tuple[str, bytes, str]],
+    files: list[ConnectorFile],
 ) -> tuple[list[RelayResult], list[RelayError]]:
     """Relay a batch of connector files to the managed S3 prefix.
 
+    Processes all files; per-file errors do not abort the batch. The caller
+    decides whether partial success is acceptable for its sync semantics.
+
     Args:
         ref:   Target managed source ref.
-        files: List of (filename, content_bytes, content_type) tuples.
+        files: List of ConnectorFile objects.
 
     Returns:
-        Tuple of (results, errors). Files that fail are recorded in errors;
-        successful files appear in results. The caller decides whether
-        partial success is acceptable.
+        (results, errors) — successful files in results, failed files in errors.
     """
     results: list[RelayResult] = []
     errors: list[RelayError] = []
 
-    for filename, content, content_type in files:
+    for file in files:
         try:
-            result = put_file(ref, filename, content, content_type)
+            result = put_file(ref, file)
             results.append(result)
         except Exception as exc:
             logger.error(
-                "managed_relay: failed to relay filename=%r source_id=%s: %s",
-                filename, ref.source_id, exc,
+                "managed_relay: relay failed connector=%s stable_id=%s source_id=%s: %s",
+                file.connector_module, file.stable_id, ref.source_id, exc,
             )
-            errors.append(RelayError(filename=filename, error=str(exc)))
+            errors.append(RelayError(
+                connector_module=file.connector_module,
+                stable_id=file.stable_id,
+                filename=file.filename,
+                error=str(exc),
+            ))
 
     logger.info(
         "managed_relay: batch done source_id=%s success=%d errors=%d",
@@ -250,27 +357,42 @@ def relay_files(
     return results, errors
 
 
-def delete_file(ref: ManagedSourceRef, filename: str) -> bool:
+def delete_file(
+    ref: ManagedSourceRef,
+    connector_module: str,
+    stable_id: str,
+    filename: str,
+) -> bool:
     """Delete a previously relayed file from the managed S3 prefix.
 
-    Used when the connector reports a file deletion (e.g. GDrive trash event).
+    The key is computed by the same object_key() formula as put_file() so that
+    delete always targets the exact object that upload created.
+
+    Used when a connector reports a file deletion (e.g. GDrive trash event).
     Pathway detects the key removal and retracts the corresponding Qdrant chunks.
 
-    Returns True if the object was deleted, False if it did not exist.
+    Args:
+        ref:              Target managed source ref.
+        connector_module: Same connector_module used at upload time.
+        stable_id:        Same stable_id used at upload time.
+        filename:         Same filename used at upload time (for extension matching).
+
+    Returns:
+        True if the DeleteObject call succeeded; False on error.
     """
-    key = ref.prefix + safe_filename(filename)
+    key = object_key(ref, connector_module, stable_id, filename)
     s3 = _build_s3_client(ref)
 
     try:
         s3.delete_object(Bucket=ref.bucket, Key=key)
         logger.info(
-            "managed_relay: delete source_id=%s s3://%s/%s",
-            ref.source_id, ref.bucket, key,
+            "managed_relay: delete source_id=%s connector=%s stable_id=%s s3://%s/%s",
+            ref.source_id, connector_module, stable_id, ref.bucket, key,
         )
         return True
     except Exception as exc:
         logger.error(
-            "managed_relay: delete failed source_id=%s key=%s: %s",
-            ref.source_id, key, exc,
+            "managed_relay: delete failed source_id=%s connector=%s stable_id=%s: %s",
+            ref.source_id, connector_module, stable_id, exc,
         )
         return False

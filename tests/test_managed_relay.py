@@ -3,40 +3,47 @@
 Boundary: boto3 S3 client is mocked throughout. No real AWS calls.
 
 Coverage:
-  - safe_filename: sanitisation cases (path traversal, special chars, empty)
-  - put_file: success (new object), success (replace), S3 error → RuntimeError
-  - relay_files: all-success, partial error, all-error
-  - delete_file: exists → True, not-exists (S3 raises) → False
+  - safe_stable_id: sanitisation cases including path traversal fragments
+  - _derive_ext: extension extraction
+  - object_key: key formula determinism, collision safety, connector namespacing
+  - put_file: ConnectorFile → RelayResult, replaced flag, S3 error path
+  - relay_files: batch success, partial error, empty batch, all errors
+  - delete_file: same key as put (delete determinism), S3 error → False
+  - ManagedSourceRef.from_source_row: construction helper
+
+Critical contract assertions:
+  - Two files with same basename but different stable_ids → different S3 keys (no collision)
+  - delete_file produces the same key as put_file for the same item (delete determinism)
+  - Repeated update to same stable_id → same key (idempotent update)
+  - Unsafe characters in stable_id → sanitised but NOT collapsing distinct IDs
 """
 
 import sys
 import types
-from dataclasses import replace
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 # ---------------------------------------------------------------------------
-# Synthetic boto3 shim so the module can be imported without the real library
+# Synthetic boto3 shim — import must succeed without real library
 # ---------------------------------------------------------------------------
 
 _fake_boto3 = types.ModuleType("boto3")
-
-def _fake_client(service, **kwargs):
-    return MagicMock()
-
-_fake_boto3.client = _fake_client
+_fake_boto3.client = lambda service, **kwargs: MagicMock()
 sys.modules.setdefault("boto3", _fake_boto3)
 
-# Now import the module under test
 from connectors.managed_relay import (
+    ConnectorFile,
     ManagedSourceRef,
     RelayError,
     RelayResult,
+    _derive_ext,
+    _build_s3_client,
     delete_file,
+    object_key,
     put_file,
     relay_files,
-    safe_filename,
+    safe_stable_id,
 )
 
 
@@ -58,12 +65,23 @@ def _ref(**overrides) -> ManagedSourceRef:
     return ManagedSourceRef(**defaults)
 
 
-def _make_s3_mock(etag='"abc123"', head_raises=True):
-    """Return a mock S3 client.
+def _file(
+    connector_module="google_drive",
+    stable_id="fileId001",
+    filename="doc.pdf",
+    content=b"bytes",
+    content_type="application/pdf",
+) -> ConnectorFile:
+    return ConnectorFile(
+        connector_module=connector_module,
+        stable_id=stable_id,
+        filename=filename,
+        content=content,
+        content_type=content_type,
+    )
 
-    head_raises=True  → HEAD raises (object does not exist → replaced=False)
-    head_raises=False → HEAD succeeds (object exists → replaced=True)
-    """
+
+def _s3_mock(etag='"abc123"', head_raises=True):
     s3 = MagicMock()
     if head_raises:
         s3.head_object.side_effect = Exception("NoSuchKey")
@@ -72,35 +90,110 @@ def _make_s3_mock(etag='"abc123"', head_raises=True):
 
 
 # ---------------------------------------------------------------------------
-# safe_filename
+# safe_stable_id
 # ---------------------------------------------------------------------------
 
-class TestSafeFilename:
-    def test_plain_filename_unchanged(self):
-        assert safe_filename("report.pdf") == "report.pdf"
+class TestSafeStableId:
+    def test_gdrive_file_id_unchanged(self):
+        fid = "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms"
+        assert safe_stable_id(fid) == fid
+
+    def test_slash_replaced(self):
+        assert safe_stable_id("driveId123/itemId456") == "driveId123_itemId456"
+
+    def test_colon_slash_replaced(self):
+        assert safe_stable_id("onedrive://driveId/itemId") == "onedrive___driveId_itemId"
 
     def test_spaces_replaced(self):
-        assert safe_filename("my report v2.docx") == "my_report_v2.docx"
+        assert safe_stable_id("item with spaces") == "item_with_spaces"
 
-    def test_path_traversal_stripped(self):
-        assert safe_filename("../../../etc/passwd") == "passwd"
+    def test_empty_maps_to_sentinel(self):
+        assert safe_stable_id("") == "_empty"
 
-    def test_backslash_path_stripped(self):
-        assert safe_filename(r"subdir\document.txt") == "document.txt"
+    def test_hyphen_underscore_preserved(self):
+        assert safe_stable_id("item-id_v2") == "item-id_v2"
 
-    def test_special_chars_replaced(self):
-        # space→_, (→_, v2, )→_, space→_, [→_, final, ]→_, !→_, .pdf
-        result = safe_filename("doc (v2) [final]!.pdf")
-        assert result == "doc__v2___final__.pdf"
+    def test_different_ids_produce_different_results(self):
+        a = safe_stable_id("folder-a/report.pdf")
+        b = safe_stable_id("folder-b/report.pdf")
+        assert a != b  # Critical: distinct IDs remain distinct
 
-    def test_empty_string_returns_unnamed(self):
-        assert safe_filename("") == "_unnamed"
 
-    def test_only_slashes_returns_unnamed(self):
-        assert safe_filename("///") == "_unnamed"
+# ---------------------------------------------------------------------------
+# _derive_ext
+# ---------------------------------------------------------------------------
 
-    def test_hyphen_and_underscore_kept(self):
-        assert safe_filename("my-doc_v2.md") == "my-doc_v2.md"
+class TestDeriveExt:
+    def test_simple_extension(self):
+        assert _derive_ext("report.pdf") == ".pdf"
+
+    def test_docx(self):
+        assert _derive_ext("document.docx") == ".docx"
+
+    def test_double_extension_returns_last(self):
+        assert _derive_ext("archive.tar.gz") == ".gz"
+
+    def test_no_extension_returns_empty(self):
+        assert _derive_ext("README") == ""
+
+    def test_empty_filename_returns_empty(self):
+        assert _derive_ext("") == ""
+
+    def test_extension_lowercased(self):
+        assert _derive_ext("image.PDF") == ".pdf"
+
+    def test_dot_only_filename(self):
+        assert _derive_ext(".hidden") == ".hidden"
+
+
+# ---------------------------------------------------------------------------
+# object_key — the key formula
+# ---------------------------------------------------------------------------
+
+class TestObjectKey:
+    def test_basic_formula(self):
+        ref = _ref()
+        key = object_key(ref, "google_drive", "fileId001", "doc.pdf")
+        assert key == "scopes/scope-1/sources/src-1/google_drive/fileId001.pdf"
+
+    def test_same_basename_different_stable_id_no_collision(self):
+        """Core collision safety: same filename, different stable_id → different key."""
+        ref = _ref()
+        key_a = object_key(ref, "google_drive", "fileIdA", "report.pdf")
+        key_b = object_key(ref, "google_drive", "fileIdB", "report.pdf")
+        assert key_a != key_b
+
+    def test_same_stable_id_same_key(self):
+        """Idempotent update: same stable_id always maps to same key."""
+        ref = _ref()
+        key1 = object_key(ref, "google_drive", "fileId001", "doc.pdf")
+        key2 = object_key(ref, "google_drive", "fileId001", "doc.pdf")
+        assert key1 == key2
+
+    def test_connector_namespace_separates_same_id(self):
+        """google_drive and onedrive with same stable_id produce different keys."""
+        ref = _ref()
+        key_gd = object_key(ref, "google_drive", "abc123", "file.pdf")
+        key_od = object_key(ref, "onedrive", "abc123", "file.pdf")
+        assert key_gd != key_od
+
+    def test_unsafe_stable_id_sanitised(self):
+        ref = _ref()
+        key = object_key(ref, "google_drive", "driveId/itemId", "doc.docx")
+        assert ".." not in key
+        assert key == "scopes/scope-1/sources/src-1/google_drive/driveId_itemId.docx"
+
+    def test_extension_from_filename_only(self):
+        ref = _ref()
+        key = object_key(ref, "google_drive", "id001", "My Report (Final).pdf")
+        assert key.endswith(".pdf")
+        # stable_id is unchanged (it was already safe)
+        assert "id001" in key
+
+    def test_no_extension_filename(self):
+        ref = _ref()
+        key = object_key(ref, "google_drive", "id001", "Makefile")
+        assert key == "scopes/scope-1/sources/src-1/google_drive/id001"
 
 
 # ---------------------------------------------------------------------------
@@ -108,71 +201,68 @@ class TestSafeFilename:
 # ---------------------------------------------------------------------------
 
 class TestPutFile:
-    def test_new_object_returns_result_replaced_false(self):
+    def test_new_object_replaced_false(self):
         ref = _ref()
-        s3 = _make_s3_mock(etag='"etag001"', head_raises=True)
+        file = _file(stable_id="fid001", filename="doc.pdf", content=b"pdfbytes")
+        s3 = _s3_mock(etag='"etag001"', head_raises=True)
         with patch("connectors.managed_relay._build_s3_client", return_value=s3):
-            result = put_file(ref, "doc.pdf", b"pdfbytes", "application/pdf")
+            result = put_file(ref, file)
 
         assert isinstance(result, RelayResult)
+        assert result.stable_id == "fid001"
+        assert result.connector_module == "google_drive"
         assert result.filename == "doc.pdf"
-        assert result.s3_key == "scopes/scope-1/sources/src-1/doc.pdf"
+        assert result.s3_key == "scopes/scope-1/sources/src-1/google_drive/fid001.pdf"
         assert result.bytes_written == 8
         assert result.etag == "etag001"
         assert result.replaced is False
 
-        s3.put_object.assert_called_once_with(
-            Bucket="agentopia-knowledge-dev",
-            Key="scopes/scope-1/sources/src-1/doc.pdf",
-            Body=b"pdfbytes",
-            ContentType="application/pdf",
-        )
-
-    def test_existing_object_returns_replaced_true(self):
+    def test_existing_object_replaced_true(self):
         ref = _ref()
-        s3 = _make_s3_mock(etag='"etag002"', head_raises=False)
+        file = _file(stable_id="fid001", filename="doc.pdf")
+        s3 = _s3_mock(etag='"etag002"', head_raises=False)
         with patch("connectors.managed_relay._build_s3_client", return_value=s3):
-            result = put_file(ref, "doc.pdf", b"newbytes")
-
+            result = put_file(ref, file)
         assert result.replaced is True
-        assert result.bytes_written == 8
-
-    def test_filename_is_sanitized_in_key(self):
-        ref = _ref()
-        s3 = _make_s3_mock()
-        with patch("connectors.managed_relay._build_s3_client", return_value=s3):
-            result = put_file(ref, "path/traversal/../secret.pdf", b"x")
-
-        assert result.s3_key == "scopes/scope-1/sources/src-1/secret.pdf"
 
     def test_s3_error_raises_runtime_error(self):
         ref = _ref()
+        file = _file()
         s3 = MagicMock()
         s3.head_object.side_effect = Exception("NoSuchKey")
         s3.put_object.side_effect = Exception("AccessDenied")
         with patch("connectors.managed_relay._build_s3_client", return_value=s3):
             with pytest.raises(RuntimeError, match="AccessDenied"):
-                put_file(ref, "doc.txt", b"bytes")
+                put_file(ref, file)
 
     def test_etag_stripped_of_quotes(self):
         ref = _ref()
-        s3 = _make_s3_mock(etag='"quoted-etag"')
+        file = _file()
+        s3 = _s3_mock(etag='"quoted-etag"')
         with patch("connectors.managed_relay._build_s3_client", return_value=s3):
-            result = put_file(ref, "file.md", b"content")
+            result = put_file(ref, file)
         assert result.etag == "quoted-etag"
 
-    def test_endpoint_url_passed_to_client(self):
+    def test_put_object_called_with_correct_key(self):
+        ref = _ref()
+        file = _file(connector_module="google_drive", stable_id="abc123", filename="spec.pdf")
+        s3 = _s3_mock()
+        with patch("connectors.managed_relay._build_s3_client", return_value=s3):
+            put_file(ref, file)
+        _, kwargs = s3.put_object.call_args
+        assert kwargs["Key"] == "scopes/scope-1/sources/src-1/google_drive/abc123.pdf"
+        assert kwargs["Bucket"] == "agentopia-knowledge-dev"
+        assert kwargs["Body"] == b"bytes"
+
+    def test_endpoint_url_passed_to_client_factory(self):
         ref = _ref(endpoint_url="http://minio:9000")
         captured = {}
-
-        def fake_client_factory(r):
-            # Inspect that endpoint_url was passed via ManagedSourceRef
+        def fake_factory(r):
             captured["ref"] = r
-            return _make_s3_mock()
-
-        with patch("connectors.managed_relay._build_s3_client", side_effect=fake_client_factory):
-            put_file(ref, "f.txt", b"x")
-
+            return _s3_mock()
+        file = _file()
+        with patch("connectors.managed_relay._build_s3_client", side_effect=fake_factory):
+            put_file(ref, file)
         assert captured["ref"].endpoint_url == "http://minio:9000"
 
 
@@ -181,46 +271,43 @@ class TestPutFile:
 # ---------------------------------------------------------------------------
 
 class TestRelayFiles:
-    def _make_files(self, *names):
-        return [(n, f"content-{n}".encode(), "text/plain") for n in names]
+    def _make_files(self, *ids):
+        return [_file(stable_id=sid, filename=f"{sid}.txt", content=f"content-{sid}".encode())
+                for sid in ids]
 
     def test_all_success(self):
         ref = _ref()
-        files = self._make_files("a.txt", "b.txt")
-        s3 = _make_s3_mock()
+        files = self._make_files("id-a", "id-b")
+        s3 = _s3_mock()
         with patch("connectors.managed_relay._build_s3_client", return_value=s3):
             results, errors = relay_files(ref, files)
-
         assert len(results) == 2
         assert len(errors) == 0
-        assert {r.filename for r in results} == {"a.txt", "b.txt"}
+        assert {r.stable_id for r in results} == {"id-a", "id-b"}
 
     def test_partial_error_continues(self):
         ref = _ref()
-        files = self._make_files("ok.txt", "bad.txt", "also-ok.txt")
-
+        files = self._make_files("ok-1", "bad", "ok-2")
         call_count = [0]
-
-        def fake_put(r, filename, content, content_type="application/octet-stream"):
+        def fake_put(r, f):
             call_count[0] += 1
-            if filename == "bad.txt":
-                raise RuntimeError("simulated S3 failure")
+            if f.stable_id == "bad":
+                raise RuntimeError("S3 failure")
             return RelayResult(
-                filename=filename,
-                s3_key=ref.prefix + filename,
-                bytes_written=len(content),
+                connector_module=f.connector_module,
+                stable_id=f.stable_id,
+                filename=f.filename,
+                s3_key=f"prefix/{f.stable_id}.txt",
+                bytes_written=len(f.content),
                 etag="etag",
                 replaced=False,
             )
-
         with patch("connectors.managed_relay.put_file", side_effect=fake_put):
             results, errors = relay_files(ref, files)
-
         assert len(results) == 2
         assert len(errors) == 1
-        assert errors[0].filename == "bad.txt"
-        assert "simulated S3 failure" in errors[0].error
-        assert call_count[0] == 3  # all three files attempted
+        assert errors[0].stable_id == "bad"
+        assert call_count[0] == 3
 
     def test_empty_batch(self):
         ref = _ref()
@@ -230,50 +317,86 @@ class TestRelayFiles:
 
     def test_all_errors(self):
         ref = _ref()
-        files = self._make_files("x.txt", "y.txt")
-
-        def always_fail(r, filename, content, content_type="application/octet-stream"):
-            raise RuntimeError("fail")
-
-        with patch("connectors.managed_relay.put_file", side_effect=always_fail):
+        files = self._make_files("x", "y")
+        with patch("connectors.managed_relay.put_file", side_effect=RuntimeError("fail")):
             results, errors = relay_files(ref, files)
-
         assert len(results) == 0
         assert len(errors) == 2
 
 
 # ---------------------------------------------------------------------------
-# delete_file
+# delete_file — delete determinism
 # ---------------------------------------------------------------------------
 
 class TestDeleteFile:
-    def test_existing_object_deleted_returns_true(self):
+    def test_delete_targets_same_key_as_put(self):
+        """Critical: delete and put reference identical S3 key for same stable_id."""
+        ref = _ref()
+        file = _file(connector_module="google_drive", stable_id="fid-xyz", filename="report.pdf")
+        s3_put = _s3_mock()
+        s3_del = MagicMock()
+
+        with patch("connectors.managed_relay._build_s3_client", return_value=s3_put):
+            result = put_file(ref, file)
+        put_key = result.s3_key
+
+        with patch("connectors.managed_relay._build_s3_client", return_value=s3_del):
+            delete_file(ref, "google_drive", "fid-xyz", "report.pdf")
+        del_key = s3_del.delete_object.call_args[1]["Key"]
+
+        assert put_key == del_key
+
+    def test_delete_success_returns_true(self):
         ref = _ref()
         s3 = MagicMock()
         with patch("connectors.managed_relay._build_s3_client", return_value=s3):
-            result = delete_file(ref, "to-delete.pdf")
-
+            result = delete_file(ref, "google_drive", "fid001", "doc.pdf")
         assert result is True
         s3.delete_object.assert_called_once_with(
             Bucket="agentopia-knowledge-dev",
-            Key="scopes/scope-1/sources/src-1/to-delete.pdf",
+            Key="scopes/scope-1/sources/src-1/google_drive/fid001.pdf",
         )
 
-    def test_s3_error_returns_false(self):
+    def test_delete_error_returns_false(self):
         ref = _ref()
         s3 = MagicMock()
         s3.delete_object.side_effect = Exception("AccessDenied")
         with patch("connectors.managed_relay._build_s3_client", return_value=s3):
-            result = delete_file(ref, "missing.pdf")
-
+            result = delete_file(ref, "google_drive", "fid001", "doc.pdf")
         assert result is False
 
-    def test_filename_sanitized_in_delete_key(self):
-        ref = _ref()
-        s3 = MagicMock()
-        with patch("connectors.managed_relay._build_s3_client", return_value=s3):
-            delete_file(ref, "../escape.pdf")
 
-        _, kwargs = s3.delete_object.call_args
-        assert kwargs["Key"].endswith("escape.pdf")
-        assert ".." not in kwargs["Key"]
+# ---------------------------------------------------------------------------
+# ManagedSourceRef.from_source_row
+# ---------------------------------------------------------------------------
+
+class TestManagedSourceRefFromSourceRow:
+    def test_constructs_from_storage_ref(self):
+        storage_ref = {
+            "bucket": "agentopia-knowledge-dev",
+            "prefix": "scopes/s1/sources/src1/",
+            "region": "ap-northeast-1",
+        }
+        ref = ManagedSourceRef.from_source_row(
+            source_id="uuid-001",
+            storage_ref=storage_ref,
+            access_key="AKIA123",
+            secret_key="secret",
+        )
+        assert ref.source_id == "uuid-001"
+        assert ref.bucket == "agentopia-knowledge-dev"
+        assert ref.prefix == "scopes/s1/sources/src1/"
+        assert ref.region == "ap-northeast-1"
+        assert ref.access_key == "AKIA123"
+        assert ref.endpoint_url is None
+
+    def test_endpoint_url_optional(self):
+        ref = ManagedSourceRef.from_source_row(
+            source_id="uuid-002",
+            storage_ref={"bucket": "b", "region": "us-east-1"},
+            access_key="k",
+            secret_key="s",
+            endpoint_url="http://minio:9000",
+        )
+        assert ref.endpoint_url == "http://minio:9000"
+        assert ref.prefix == ""  # missing prefix defaults to ""
